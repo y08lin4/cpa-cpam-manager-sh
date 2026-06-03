@@ -1,0 +1,12 @@
+.secrets.txt
+*.bak.*
+backups/
+auths/
+logs/
+cpa-manager-data/
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp
