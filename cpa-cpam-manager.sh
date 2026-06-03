@@ -32,7 +32,7 @@ die() {
 
 need_root() {
   if [ "${EUID}" -ne 0 ]; then
-    echo "?? root ??"
+    echo "请用 root 运行"
     exit 1
   fi
 }
@@ -128,20 +128,20 @@ install_basic_deps() {
     return 0
   fi
 
-  command -v apt-get >/dev/null 2>&1 || die "?????? apt-get?????? Debian/Ubuntu"
-  log "??????: ${missing[*]}"
+  command -v apt-get >/dev/null 2>&1 || die "当前系统缺少 apt-get，脚本仅支持 Debian/Ubuntu"
+  log "安装基础依赖: ${missing[*]}"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y "${missing[@]}"
 }
 
 install_docker() {
-  command -v curl >/dev/null 2>&1 || die "?? curl????? Docker"
-  log "???? Docker"
+  command -v curl >/dev/null 2>&1 || die "缺少 curl，无法安装 Docker"
+  log "开始安装 Docker"
   bash <(curl -fsSL https://get.docker.com)
 
   if has_systemd; then
-    systemctl enable --now docker || warn "systemctl ?? Docker ?????? service docker start"
+    systemctl enable --now docker || warn "systemctl 启动 Docker 失败，将尝试 service docker start"
   fi
 
   if ! docker info >/dev/null 2>&1; then
@@ -153,10 +153,10 @@ ensure_docker_interactive() {
   if command -v docker >/dev/null 2>&1; then
     docker --version || true
   else
-    if ask_yes_no "???? Docker??????? Docker" "Y"; then
+    if ask_yes_no "未检测到 Docker，是否现在安装 Docker" "Y"; then
       install_docker
     else
-      die "??? Docker?????"
+      die "未安装 Docker，无法继续"
     fi
   fi
 
@@ -168,19 +168,19 @@ ensure_docker_interactive() {
     fi
   fi
 
-  docker info >/dev/null 2>&1 || die "Docker daemon ??????? Docker ??"
+  docker info >/dev/null 2>&1 || die "Docker daemon 不正常，请检查 Docker 服务"
 
   if docker compose version >/dev/null 2>&1; then
     docker compose version
     return 0
   fi
 
-  warn "???? docker compose plugin????? docker-compose-plugin"
-  command -v apt-get >/dev/null 2>&1 || die "?????? apt-get????? docker-compose-plugin"
+  warn "未检测到 docker compose plugin，尝试安装 docker-compose-plugin"
+  command -v apt-get >/dev/null 2>&1 || die "当前系统缺少 apt-get，无法安装 docker-compose-plugin"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y docker-compose-plugin
-  docker compose version >/dev/null 2>&1 || die "docker compose ????????? Docker Compose ??"
+  docker compose version >/dev/null 2>&1 || die "docker compose 不可用，请手动检查 Docker Compose 插件"
   docker compose version
 }
 
@@ -211,7 +211,7 @@ get_server_ip() {
   local server_ip
   server_ip="$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
   if [ -z "$server_ip" ]; then
-    server_ip="?????IP"
+    server_ip="你的服务器IP"
   fi
   printf '%s\n' "$server_ip"
 }
@@ -314,8 +314,8 @@ detect_cpam_port() {
 
 ensure_compose_dir() {
   local install_dir="$1"
-  [ -d "$install_dir" ] || die "???????: $install_dir"
-  [ -f "$install_dir/docker-compose.yml" ] || die "??? docker-compose.yml: $install_dir/docker-compose.yml"
+  [ -d "$install_dir" ] || die "安装目录不存在: $install_dir"
+  [ -f "$install_dir/docker-compose.yml" ] || die "未找到 docker-compose.yml: $install_dir/docker-compose.yml"
 }
 
 compose_in_dir() {
@@ -333,7 +333,7 @@ backup_existing_files() {
   for file in config.yaml docker-compose.yml; do
     if [ -f "$install_dir/$file" ]; then
       cp -a "$install_dir/$file" "$install_dir/$file.bak.$ts"
-      log "??? $install_dir/$file -> $install_dir/$file.bak.$ts"
+      log "已备份 $install_dir/$file -> $install_dir/$file.bak.$ts"
     fi
   done
 }
@@ -455,23 +455,23 @@ handle_firewall() {
   command -v ufw >/dev/null 2>&1 || return 0
 
   if ufw status 2>/dev/null | grep -qw "active"; then
-    log "UFW ???????? CPA / CPA-Manager ????"
+    log "UFW 已启用，自动放行 CPA / CPA-Manager 相关端口"
     for port in "${ports[@]}"; do
       ufw allow "${port}/tcp"
     done
-    warn "???????????? 8317/18317?????????????"
+    warn "请同时在云厂商安全组放行 8317/18317（或你自定义的宿主机端口）"
     return 0
   fi
 
-  if ask_yes_no "UFW ??????????? SSH?CPA?CPA-Manager ????" "N"; then
+  if ask_yes_no "UFW 未启用，是否启用并放行 SSH、CPA、CPA-Manager 相关端口" "N"; then
     ufw allow 22/tcp
     for port in "${ports[@]}"; do
       ufw allow "${port}/tcp"
     done
     ufw --force enable
-    warn "???????????? 8317/18317?????????????"
+    warn "请同时在云厂商安全组放行 8317/18317（或你自定义的宿主机端口）"
   else
-    warn "UFW ???????????????? 8317/18317"
+    warn "UFW 未启用；如有云厂商安全组，请放行 8317/18317"
   fi
 }
 
@@ -489,13 +489,13 @@ pre_install_cleanup() {
     return 0
   fi
 
-  warn "??????????${found[*]}"
+  warn "检测到已有相关容器：${found[*]}"
   show_all_containers
 
-  if ask_yes_no "???????????" "Y"; then
+  if ask_yes_no "是否删除这些容器并重建" "Y"; then
     docker rm -f "${found[@]}"
   else
-    die "?????/??"
+    die "已取消安装/重装"
   fi
 }
 
@@ -519,12 +519,12 @@ create_backup_archive() {
   done
 
   if [ "${#items[@]}" -eq 0 ]; then
-    warn "????????"
+    warn "没有可备份的文件"
     return 0
   fi
 
-  (cd "$install_dir" && tar -czf "$backup_file" "${items[@]}") || die "????: $backup_file"
-  log "????: $backup_file"
+  (cd "$install_dir" && tar -czf "$backup_file" "${items[@]}") || die "备份失败: $backup_file"
+  log "备份完成: $backup_file"
 }
 
 health_check() {
@@ -544,20 +544,20 @@ health_check() {
     api_key="$(load_secrets_value "$install_dir/.secrets.txt" "API_KEY" || true)"
   fi
 
-  log "CPA API ????: http://127.0.0.1:${cpa_host_port}/v1/models"
+  log "CPA API 健康检查: http://127.0.0.1:${cpa_host_port}/v1/models"
   if [ -n "$api_key" ]; then
     if response="$(curl -sS --max-time 8 "http://127.0.0.1:${cpa_host_port}/v1/models" -H "Authorization: Bearer ${api_key}" 2>&1)"; then
       printf '%s\n' "${response:0:1000}"
     else
-      warn "CPA API ??????: $response"
+      warn "CPA API 健康检查失败: $response"
     fi
   else
-    warn "??? API_KEY??? CPA API ????"
+    warn "未找到 API_KEY，跳过 CPA API 鉴权检查"
   fi
 
-  log "CPA-Manager ????: http://127.0.0.1:${cpam_host_port}/management.html"
+  log "CPA-Manager 健康检查: http://127.0.0.1:${cpam_host_port}/management.html"
   if ! curl -I --max-time 8 "http://127.0.0.1:${cpam_host_port}/management.html"; then
-    warn "CPA-Manager ??????"
+    warn "CPA-Manager 页面检查失败"
   fi
 }
 
@@ -571,12 +571,12 @@ print_install_summary() {
 
   cat <<EOF
 
-????
+安装完成
 
 CPA API:
 http://$server_ip:$cpa_host_port/v1
 
-CPA ????:
+CPA 自带面板:
 http://$server_ip:$cpa_host_port/management.html
 
 CPA-Manager:
@@ -588,11 +588,11 @@ $api_key
 MGT_KEY:
 $mgt_key
 
-???????
+密钥已保存到：
 $install_dir/.secrets.txt
 
-???? CPA-Manager ???? Setup????
-CPA ??: $CPA_MANAGER_SETUP_UPSTREAM
+首次打开 CPA-Manager 如果出现 Setup，请填：
+CPA 地址: $CPA_MANAGER_SETUP_UPSTREAM
 Management Key: $mgt_key
 EOF
 }
@@ -608,34 +608,34 @@ install_cpa_cpam() {
   local mgt_key
   local server_ip
 
-  install_dir="$(read_with_default "??????????? [$install_dir_default]: " "$install_dir_default")"
-  cpa_host_port="$(read_with_default "CLIProxyAPI ???????????? [$cpa_port_default]: " "$cpa_port_default")"
-  cpam_host_port="$(read_with_default "CPA-Manager ???????????? [$cpam_port_default]: " "$cpam_port_default")"
+  install_dir="$(read_with_default "安装目录，回车使用默认 [$install_dir_default]: " "$install_dir_default")"
+  cpa_host_port="$(read_with_default "CLIProxyAPI 宿主机端口，回车使用默认 [$cpa_port_default]: " "$cpa_port_default")"
+  cpam_host_port="$(read_with_default "CPA-Manager 宿主机端口，回车使用默认 [$cpam_port_default]: " "$cpam_port_default")"
 
-  validate_port "$cpa_host_port" || die "CLIProxyAPI ???????: $cpa_host_port"
-  validate_port "$cpam_host_port" || die "CPA-Manager ???????: $cpam_host_port"
+  validate_port "$cpa_host_port" || die "CLIProxyAPI 宿主机端口无效: $cpa_host_port"
+  validate_port "$cpam_host_port" || die "CPA-Manager 宿主机端口无效: $cpam_host_port"
 
   if [ -n "${API_KEY:-}" ]; then
-    api_key="$(read_with_default "API_KEY?????????????: " "${API_KEY:-}")"
+    api_key="$(read_with_default "API_KEY，回车使用环境变量提供的值: " "${API_KEY:-}")"
   else
-    api_key="$(read_with_default "API_KEY??????? ????: " "")"
+    api_key="$(read_with_default "API_KEY，回车使用默认 自动生成: " "")"
   fi
   if [ -z "$api_key" ]; then
     api_key="$(generate_api_key)"
   fi
 
   if [ -n "${MGT_KEY:-}" ]; then
-    mgt_key="$(read_with_default "MGT_KEY?????????????: " "${MGT_KEY:-}")"
+    mgt_key="$(read_with_default "MGT_KEY，回车使用环境变量提供的值: " "${MGT_KEY:-}")"
   else
-    mgt_key="$(read_with_default "MGT_KEY??????? ????: " "")"
+    mgt_key="$(read_with_default "MGT_KEY，回车使用默认 自动生成: " "")"
   fi
   if [ -z "$mgt_key" ]; then
     mgt_key="$(generate_mgt_key)"
   fi
 
   if [ -d "$install_dir" ] && { [ -f "$install_dir/config.yaml" ] || [ -f "$install_dir/docker-compose.yml" ]; }; then
-    if ! ask_yes_no "????????????????/???????" "Y"; then
-      die "?????/??"
+    if ! ask_yes_no "检测到已有安装文件，是否继续安装/重装并覆盖配置" "Y"; then
+      die "已取消安装/重装"
     fi
   fi
 
@@ -648,9 +648,9 @@ install_cpa_cpam() {
   write_secrets "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip"
   handle_firewall "$cpa_host_port" "$cpam_host_port"
 
-  log "?????????"
-  compose_in_dir "$install_dir" pull || die "docker compose pull ??"
-  compose_in_dir "$install_dir" up -d || die "docker compose up -d ??"
+  log "拉取镜像并启动容器"
+  compose_in_dir "$install_dir" pull || die "docker compose pull 失败"
+  compose_in_dir "$install_dir" up -d || die "docker compose up -d 失败"
   sleep 8
   show_all_containers
   health_check "$install_dir" "$api_key" "$cpa_host_port" "$cpam_host_port"
@@ -664,15 +664,15 @@ upgrade_cpa_cpam() {
 
   detected_dir="$(detect_install_dir)"
   show_all_containers
-  install_dir="$(read_with_default "???????????? [$detected_dir]: " "$detected_dir")"
+  install_dir="$(read_with_default "安装目录，回车使用检测值 [$detected_dir]: " "$detected_dir")"
   ensure_compose_dir "$install_dir"
 
   backup_file="$install_dir/backups/pre-upgrade-$(timestamp).tar.gz"
   create_backup_archive "$install_dir" "$backup_file" docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data
 
-  log "?? CPA + CPA-Manager"
-  compose_in_dir "$install_dir" pull || die "docker compose pull ??"
-  compose_in_dir "$install_dir" up -d || die "docker compose up -d ??"
+  log "升级 CPA + CPA-Manager"
+  compose_in_dir "$install_dir" pull || die "docker compose pull 失败"
+  compose_in_dir "$install_dir" up -d || die "docker compose up -d 失败"
   sleep 8
   show_all_containers
   health_check "$install_dir"
@@ -682,21 +682,21 @@ start_cpa_cpam() {
   local install_dir
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
-  compose_in_dir "$install_dir" up -d || die "????"
+  compose_in_dir "$install_dir" up -d || die "启动失败"
 }
 
 stop_cpa_cpam() {
   local install_dir
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
-  compose_in_dir "$install_dir" stop || die "????"
+  compose_in_dir "$install_dir" stop || die "停止失败"
 }
 
 restart_cpa_cpam() {
   local install_dir
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
-  compose_in_dir "$install_dir" restart || die "????"
+  compose_in_dir "$install_dir" restart || die "重启失败"
 }
 
 status_cpa_cpam() {
@@ -709,27 +709,27 @@ status_cpa_cpam() {
   cpam_host_port="$(detect_cpam_port "$install_dir")"
 
   cat <<EOF
-????????: $install_dir
-CPA ??: $cpa_host_port
-CPA-Manager ??: $cpam_host_port
+检测到的安装目录: $install_dir
+CPA 端口: $cpa_host_port
+CPA-Manager 端口: $cpam_host_port
 
-????:
+容器状态:
 EOF
   show_all_containers
-  printf '\n??????:\n'
+  printf '\n健康检查结果:\n'
   health_check "$install_dir" "" "$cpa_host_port" "$cpam_host_port"
 }
 
 logs_cpa_cpam() {
   local choice
   cat <<'EOF'
-??????????
+请选择要查看的日志：
 1) cli-proxy-api
 2) cpa-manager
-3) ?????? 120 ?
+3) 两个都看最近 120 行
 EOF
   if [ -t 0 ]; then
-    printf "????? [3]: "
+    printf "请输入选项 [3]: "
     read -r choice || choice="3"
   else
     choice="3"
@@ -747,7 +747,7 @@ EOF
       printf '\n===== %s =====\n' "$CPAM_CONTAINER"
       docker logs --tail=120 "$CPAM_CONTAINER" || true
       ;;
-    *) warn "????" ;;
+    *) warn "无效选项" ;;
   esac
 }
 
@@ -775,9 +775,9 @@ show_keys() {
     return 0
   fi
 
-  warn "??? $secrets_file???? config.yaml ??"
+  warn "未找到 $secrets_file，尝试从 config.yaml 读取"
   if [ ! -f "$install_dir/config.yaml" ]; then
-    die "??? config.yaml???????"
+    die "未找到 config.yaml，无法查看密钥"
   fi
 
   api_key="$(awk '/api-keys:/ { in_api=1; next } in_api && /^[[:space:]]*-[[:space:]]*"/ { gsub(/^[[:space:]]*-[[:space:]]*"/, ""); gsub(/"[[:space:]]*$/, ""); print; exit }' "$install_dir/config.yaml")"
@@ -786,15 +786,15 @@ show_keys() {
   if [ -n "$api_key" ]; then
     printf 'API_KEY=%s\n' "$api_key"
   else
-    warn "??? config.yaml ?? API_KEY"
+    warn "未能从 config.yaml 读取 API_KEY"
   fi
 
   if [[ "$mgt_key" == \$2a\$* || "$mgt_key" == \$2b\$* || "$mgt_key" == \$2y\$* ]]; then
-    warn "config.yaml ?? Management Key ? bcrypt hash???????????? .secrets.txt ?????"
+    warn "config.yaml 里的 Management Key 是 bcrypt hash，无法反推出明文，请查看 .secrets.txt 或重新设置"
   elif [ -n "$mgt_key" ]; then
     printf 'MGT_KEY=%s\n' "$mgt_key"
   else
-    warn "??? config.yaml ?? MGT_KEY"
+    warn "未能从 config.yaml 读取 MGT_KEY"
   fi
 }
 
@@ -812,30 +812,30 @@ uninstall_cpa_cpam() {
   local install_dir
 
   detected_dir="$(detect_install_dir)"
-  install_dir="$(read_with_default "???????????? [$detected_dir]: " "$detected_dir")"
+  install_dir="$(read_with_default "安装目录，回车使用检测值 [$detected_dir]: " "$detected_dir")"
 
-  if ! ask_yes_no "???? CPA + CPA-Manager" "N"; then
-    log "?????"
+  if ! ask_yes_no "确认卸载 CPA + CPA-Manager" "N"; then
+    log "已取消卸载"
     return 0
   fi
 
   if [ -f "$install_dir/docker-compose.yml" ]; then
-    compose_in_dir "$install_dir" down || warn "docker compose down ????????"
+    compose_in_dir "$install_dir" down || warn "docker compose down 失败，请手动检查"
   else
-    warn "??? docker-compose.yml??? docker compose down"
+    warn "未找到 docker-compose.yml，跳过 docker compose down"
   fi
 
-  if ask_yes_no "??????" "Y"; then
-    log "???????: $install_dir"
+  if ask_yes_no "是否保留数据" "Y"; then
+    log "已保留安装目录: $install_dir"
     return 0
   fi
 
-  safe_install_dir_for_delete "$install_dir" || die "????????: $install_dir"
-  if ask_yes_no "???????? $install_dir" "N"; then
+  safe_install_dir_for_delete "$install_dir" || die "拒绝删除危险目录: $install_dir"
+  if ask_yes_no "确认删除安装目录 $install_dir" "N"; then
     rm -rf -- "$install_dir"
-    log "???????: $install_dir"
+    log "已删除安装目录: $install_dir"
   else
-    log "???????: $install_dir"
+    log "已保留安装目录: $install_dir"
   fi
 }
 
@@ -847,30 +847,30 @@ codex_login_hint() {
 cd $install_dir
 docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-login
 
-??????????????? ssh -L ????????????????????
+按提示在你本地电脑执行它给出的 ssh -L 隧道命令，然后用本地浏览器打开授权链接。
 EOF
 }
 
 print_help() {
   cat <<'EOF'
-???
-  bash cpa-cpam-manager.sh [??]
+用法：
+  bash cpa-cpam-manager.sh [命令]
 
-???
-  menu       ????
-  install    ?? / ?? CPA + CPA-Manager
-  upgrade    ?? CPA + CPA-Manager
-  start      ??
-  stop       ??
-  restart    ??
-  status     ?? / ????
-  logs       ????
-  backup     ??
-  keys       ???? / ??
-  uninstall  ??
-  help       ????
+命令：
+  menu       交互菜单
+  install    安装 / 重装 CPA + CPA-Manager
+  upgrade    升级 CPA + CPA-Manager
+  start      启动
+  stop       停止
+  restart    重启
+  status     状态 / 健康检查
+  logs       查看日志
+  backup     备份
+  keys       查看密钥 / 地址
+  uninstall  卸载
+  help       显示帮助
 
-???????
+可用环境变量：
   INSTALL_DIR=/opt/cliproxy-cpam
   CPA_HOST_PORT=8317
   CPAM_HOST_PORT=18317
@@ -884,22 +884,22 @@ menu_loop() {
   while true; do
     cat <<'EOF'
 
-CLIProxyAPI + CPA-Manager ????
+CLIProxyAPI + CPA-Manager 运维脚本
 
-1) ?? / ?? CPA + CPA-Manager
-2) ?? CPA + CPA-Manager
-3) ??
-4) ??
-5) ??
-6) ?? / ????
-7) ????
-8) ??
-9) ???? / ??
-10) Codex OAuth ??????
-11) ??
-0) ??
+1) 安装 / 重装 CPA + CPA-Manager
+2) 升级 CPA + CPA-Manager
+3) 启动
+4) 停止
+5) 重启
+6) 状态 / 健康检查
+7) 查看日志
+8) 备份
+9) 查看密钥 / 地址
+10) Codex OAuth 登录命令提示
+11) 卸载
+0) 退出
 EOF
-    printf "?????: "
+    printf "请输入选项: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -913,8 +913,8 @@ EOF
       9) show_keys ;;
       10) codex_login_hint ;;
       11) uninstall_cpa_cpam ;;
-      0) log "???"; break ;;
-      *) warn "????" ;;
+      0) log "已退出"; break ;;
+      *) warn "无效选项" ;;
     esac
   done
 }
@@ -935,7 +935,7 @@ main() {
       ;;
     *)
       print_help
-      die "????: $command_name"
+      die "未知命令: $command_name"
       ;;
   esac
 
