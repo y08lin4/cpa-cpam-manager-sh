@@ -7,6 +7,11 @@
 - `cli-proxy-api`：使用镜像 `eceasy/cli-proxy-api:latest`
 - `cpa-manager`：使用镜像 `seakee/cpa-manager:latest`
 
+上游原仓库：
+
+- CLIProxyAPI: https://github.com/router-for-me/CLIProxyAPI
+- CPA-Manager: https://github.com/seakee/CPA-Manager
+
 默认安装目录：`/opt/cliproxy-cpam`
 
 > 本项目不会安装错误的静态 nginx 面板 `cpa-management-center`。如果脚本检测到旧容器，会在安装/重装时提示是否删除。
