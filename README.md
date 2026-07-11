@@ -130,6 +130,7 @@ bash cpa-cpam-manager.sh backup
 | `migrate --dry-run` | 输出迁移计划，不修改文件或停止容器 |
 | `migrate` | 正式迁移旧 CPA-Manager，并在失败时自动回滚 |
 | `rollback` | 恢复最近一次迁移前快照 |
+| `security` | 查看 24 小时访问来源 IP 和服务器出口 IP 信息 |
 | `start` | 启动 Compose 服务 |
 | `stop` | 停止 Compose 服务 |
 | `restart` | 重启 Compose 服务 |
@@ -164,6 +165,8 @@ bash cpa-cpam-manager.sh install
 | `MGT_KEY` | 自动生成 | CPA Management API 密钥 |
 | `CPAMP_ADMIN_KEY` | 自动生成 | Plus 登录和管理 API 密钥 |
 | `CPAM_IMAGE` | `seakee/cpa-manager-plus:latest` | Plus 镜像，可指定版本 tag |
+| `CPA_IMAGE` | `eceasy/cli-proxy-api:latest` | CLIProxyAPI 镜像，可指定版本 tag |
+| `ASSUME_YES` | `0` | 设为 `1` 时自动确认高风险操作，仅用于可信自动化环境 |
 
 自动生成的密钥格式：
 
@@ -262,6 +265,27 @@ Docker named volume、自定义宿主机目录或无法确认的数据挂载会�
 ```bash
 bash cpa-cpam-manager.sh upgrade
 ```
+
+升级不会直接重建容器，而是先执行版本检查：
+
+1. 读取两个运行容器当前使用的镜像版本和 Image ID。
+2. 拉取相同镜像引用在仓库中的最新版本，不影响当前容器。
+3. 优先展示 OCI 语义版本；无版本标签时展示 tag、revision 和短 Image ID。
+4. 对比当前与目标 Image ID，明确标记“可升级”或“已是最新”。
+5. 展示安装目录、备份位置、短暂停机影响和数据保留策略。
+6. 用户明确确认后创建一致性备份并重新创建服务。
+
+若两个服务均为最新镜像，脚本默认退出，不会无意义重建容器。
+
+### 安全巡检
+
+```bash
+bash cpa-cpam-manager.sh security
+```
+
+安全巡检会从最近 24 小时的 CLIProxyAPI 容器日志和文件日志中提取公开来源 IPv4/IPv6，按出现次数列出前 30 个，并统计常见 401、403、unauthorized、forbidden 等鉴权失败线索。
+
+随后脚本会单独询问是否调用 [IPPure](https://my.ippure.com/v1/info)。该接口返回服务器出口 IP 的位置、ASN 等信息，不用于查询每一个访问者 IP。接口若返回风险系数、原生 IP、机房 IP 字段则展示；未返回时明确标记“接口未返回”。
 
 升级前自动创建：
 

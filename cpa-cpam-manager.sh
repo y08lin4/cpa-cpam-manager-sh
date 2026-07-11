@@ -4,7 +4,7 @@ set -Eeuo pipefail
 DEFAULT_INSTALL_DIR="/opt/cliproxy-cpam"
 DEFAULT_CPA_HOST_PORT="8317"
 DEFAULT_CPAM_HOST_PORT="18317"
-CPA_IMAGE="eceasy/cli-proxy-api:latest"
+CPA_IMAGE="${CPA_IMAGE:-eceasy/cli-proxy-api:latest}"
 CPAM_IMAGE="${CPAM_IMAGE:-seakee/cpa-manager-plus:latest}"
 OLD_PANEL_CONTAINER="cpa-management-center"
 CPA_CONTAINER="cli-proxy-api"
@@ -101,6 +101,11 @@ ask_yes_no() {
   local suffix
   local answer
 
+  if [ "${ASSUME_YES:-0}" = "1" ]; then
+    warn "ASSUME_YES=1：自动确认操作：$prompt"
+    return 0
+  fi
+
   if [ "$default" = "Y" ]; then
     suffix="[Y/n]"
   else
@@ -155,13 +160,13 @@ validate_port() {
 }
 
 install_basic_deps() {
-  local packages=(curl git ca-certificates openssl ufw)
+  local packages=(curl git ca-certificates openssl ufw jq python3)
   local missing=()
   local package
 
   for package in "${packages[@]}"; do
     case "$package" in
-      curl|git|openssl|ufw)
+      curl|git|openssl|ufw|jq|python3)
         if ! command -v "$package" >/dev/null 2>&1; then
           missing+=("$package")
         fi
@@ -397,8 +402,71 @@ show_menu_status() {
   fi
 }
 
-show_all_containers() {
-  docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+# 将镜像 ID 缩短为便于人工核对的 12 位标识。
+short_image_id() {
+  local image_id="$1"
+  image_id="${image_id#sha256:}"
+  printf '%s\n' "${image_id:0:12}"
+}
+
+container_image_id() {
+  local container="$1"
+  docker inspect -f '{{.Image}}' "$container" 2>/dev/null || true
+}
+
+image_ref_id() {
+  local image_ref="$1"
+  docker image inspect -f '{{.Id}}' "$image_ref" 2>/dev/null || true
+}
+
+# 优先显示 OCI 语义版本；上游未提供标签时使用镜像引用和短 ID。
+image_display_version() {
+  local image_id="$1"
+  local image_ref="$2"
+  local version
+  local revision
+  local short_id
+
+  short_id="$(short_image_id "$image_id")"
+  version="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image_id" 2>/dev/null || true)"
+  revision="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_id" 2>/dev/null || true)"
+  [ "$version" = "<no value>" ] && version=""
+  [ "$revision" = "<no value>" ] && revision=""
+
+  if [ -n "$version" ]; then
+    printf '%s (%s)\n' "$version" "$short_id"
+  elif [ -n "$revision" ]; then
+    printf '%s@%.12s (%s)\n' "$image_ref" "$revision" "$short_id"
+  else
+    printf '%s (%s)\n' "$image_ref" "$short_id"
+  fi
+}
+
+pull_image_quietly() {
+  local image_ref="$1"
+  if ! docker pull --quiet "$image_ref" >/dev/null; then
+    err "无法检查最新镜像: $image_ref"
+    return 1
+  fi
+}
+
+print_upgrade_service() {
+  local label="$1"
+  local current_version="$2"
+  local target_version="$3"
+  local changed="$4"
+  local icon="$ICON_OK"
+
+  [ "$changed" = "true" ] && icon="$ICON_WARN"
+
+  printf '%b  %b%s%b\n' "$icon" "$COLOR_BOLD" "$label" "$COLOR_RESET"
+  printf '   当前：%s\n' "$current_version"
+  printf '   目标：%s\n' "$target_version"
+  if [ "$changed" = "true" ]; then
+    printf '   结论：%b发现新镜像，可升级%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
+  else
+    printf '   结论：%b已是最新镜像%b\n' "$COLOR_GREEN" "$COLOR_RESET"
+  fi
 }
 
 # -----------------------------------------------------------------------------
@@ -495,7 +563,7 @@ ensure_compose_dir() {
 compose_in_dir() {
   local install_dir="$1"
   shift
-  (cd "$install_dir" && docker compose "$@")
+  (cd "$install_dir" && COMPOSE_IGNORE_ORPHANS=True docker compose "$@")
 }
 
 backup_existing_files() {
@@ -678,9 +746,9 @@ pre_install_cleanup() {
   fi
 
   warn "检测到已有相关容器：${found[*]}"
-  show_all_containers
+  show_menu_status
 
-  if ask_yes_no "是否删除这些容器并重建" "Y"; then
+  if ask_yes_no "确认删除上述容器并重建" "N"; then
     docker rm -f "${found[@]}"
   else
     die "已取消安装/重装"
@@ -778,7 +846,6 @@ health_check() {
   local api_key="${2:-}"
   local cpa_host_port="${3:-}"
   local cpam_host_port="${4:-}"
-  local response
   local cpamp_admin_key
   local manager_container
 
@@ -792,39 +859,49 @@ health_check() {
     api_key="$(load_secrets_value "$install_dir/.secrets.txt" "API_KEY" || true)"
   fi
 
-  log "CPA API 健康检查: http://127.0.0.1:${cpa_host_port}/v1/models"
+  printf 'CPA API：'
   if [ -n "$api_key" ]; then
-    if response="$(curl -sS --max-time 8 "http://127.0.0.1:${cpa_host_port}/v1/models" -H "Authorization: Bearer ${api_key}" 2>&1)"; then
-      printf '%s\n' "${response:0:1000}"
+    if curl -fsS --max-time 8 "http://127.0.0.1:${cpa_host_port}/v1/models" -H "Authorization: Bearer ${api_key}" >/dev/null 2>&1; then
+      printf '%b  正常（/v1/models）\n' "$ICON_OK"
     else
-      warn "CPA API 健康检查失败: $response"
+      printf '%b  失败（/v1/models）\n' "$ICON_ERROR"
     fi
   else
-    warn "未找到 API_KEY，跳过 CPA API 鉴权检查"
+    printf '%b  跳过，未找到 API_KEY\n' "$ICON_WARN"
   fi
 
   manager_container="$(active_cpam_container)"
   if [ "$manager_container" = "$CPAM_CONTAINER" ]; then
-    log "CPA Manager Plus 健康检查: http://127.0.0.1:${cpam_host_port}/health"
-    if ! curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health"; then
-      warn "CPA Manager Plus /health 检查失败"
+    printf 'Plus 健康：'
+    if curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null 2>&1; then
+      printf '%b  正常（/health）\n' "$ICON_OK"
+    else
+      printf '%b  失败（/health）\n' "$ICON_ERROR"
     fi
-    if ! curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/usage-service/info" >/dev/null; then
-      warn "CPA Manager Plus 兼容端点检查失败"
+    printf '兼容端点：'
+    if curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/usage-service/info" >/dev/null 2>&1; then
+      printf '%b  正常（/usage-service/info）\n' "$ICON_OK"
+    else
+      printf '%b  失败（/usage-service/info）\n' "$ICON_ERROR"
     fi
     cpamp_admin_key="$(load_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" || true)"
+    printf '鉴权状态：'
     if [ -n "$cpamp_admin_key" ]; then
-      if ! curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/status" -H "Authorization: Bearer ${cpamp_admin_key}" >/dev/null; then
-        warn "CPA Manager Plus /status 鉴权检查失败"
+      if curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/status" -H "Authorization: Bearer ${cpamp_admin_key}" >/dev/null 2>&1; then
+        printf '%b  正常（/status）\n' "$ICON_OK"
+      else
+        printf '%b  失败（/status）\n' "$ICON_ERROR"
       fi
     else
-      warn "未找到 CPAMP_ADMIN_KEY，跳过 Plus 鉴权状态检查"
+      printf '%b  跳过，未找到 CPAMP_ADMIN_KEY\n' "$ICON_WARN"
     fi
   fi
 
-  log "Manager 页面检查: http://127.0.0.1:${cpam_host_port}/management.html"
-  if ! curl -I --max-time 8 "http://127.0.0.1:${cpam_host_port}/management.html"; then
-    warn "Manager 页面检查失败"
+  printf '管理页面：'
+  if curl -fsS --max-time 8 -o /dev/null "http://127.0.0.1:${cpam_host_port}/management.html" 2>/dev/null; then
+    printf '%b  可访问（/management.html）\n' "$ICON_OK"
+  else
+    printf '%b  无法访问（/management.html）\n' "$ICON_ERROR"
   fi
 }
 
@@ -872,9 +949,9 @@ validate_plus_migration() {
   for attempt in 1 2 3 4 5 6; do
     if container_exists "$CPAM_CONTAINER" &&
        [ "$(docker inspect -f '{{.State.Running}}' "$CPAM_CONTAINER" 2>/dev/null || true)" = "true" ] &&
-       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null &&
-       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/usage-service/info" >/dev/null &&
-       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/status" -H "Authorization: Bearer ${cpamp_admin_key}" >/dev/null &&
+       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null 2>&1 &&
+       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/usage-service/info" >/dev/null 2>&1 &&
+       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/status" -H "Authorization: Bearer ${cpamp_admin_key}" >/dev/null 2>&1 &&
        [ -s "$install_dir/cpa-manager-data/data.key" ]; then
       return 0
     fi
@@ -986,9 +1063,24 @@ install_cpa_cpam() {
   fi
 
   if [ -d "$install_dir" ] && { [ -f "$install_dir/config.yaml" ] || [ -f "$install_dir/docker-compose.yml" ]; }; then
-    if ! ask_yes_no "检测到已有安装文件，是否继续安装/重装并覆盖配置" "Y"; then
+    print_section "重装确认"
+    printf '安装目录：%s\n' "$install_dir"
+    printf '影响：现有 Compose 和 config.yaml 会先备份再覆盖，数据目录保留。\n'
+    if ! ask_yes_no "确认继续安装/重装" "N"; then
       die "已取消安装/重装"
     fi
+  fi
+
+  print_section "安装确认"
+  printf '安装目录：%s\n' "$install_dir"
+  printf 'CPA 端口：%s\n' "$cpa_host_port"
+  printf 'Manager 端口：%s\n' "$cpam_host_port"
+  printf 'CPA 镜像：%s\n' "$CPA_IMAGE"
+  printf 'Manager 镜像：%s\n' "$CPAM_IMAGE"
+  printf '数据策略：配置文件会备份后写入，auths、logs 和 cpa-manager-data 持久化。\n'
+  if ! ask_yes_no "已核对安装信息，确认继续" "N"; then
+    log "已取消安装"
+    return 0
   fi
 
   pre_install_cleanup
@@ -1004,7 +1096,7 @@ install_cpa_cpam() {
   compose_in_dir "$install_dir" pull || die "docker compose pull 失败"
   compose_in_dir "$install_dir" up -d || die "docker compose up -d 失败"
   sleep 8
-  show_all_containers
+  show_menu_status
   health_check "$install_dir" "$api_key" "$cpa_host_port" "$cpam_host_port"
   print_install_summary "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip" "$cpamp_admin_key"
 }
@@ -1014,6 +1106,18 @@ upgrade_cpa_cpam() {
   local install_dir
   local backup_file
   local install_type
+  local cpa_target_ref
+  local manager_target_ref
+  local cpa_current_id
+  local manager_current_id
+  local cpa_target_id
+  local manager_target_id
+  local cpa_current_version
+  local manager_current_version
+  local cpa_target_version
+  local manager_target_version
+  local cpa_changed="false"
+  local manager_changed="false"
 
   install_type="$(detect_install_type)"
   case "$install_type" in
@@ -1022,18 +1126,66 @@ upgrade_cpa_cpam() {
   esac
 
   detected_dir="$(detect_install_dir)"
-  show_all_containers
-  install_dir="$(read_with_default "安装目录，回车使用检测值 [$detected_dir]: " "$detected_dir")"
+  print_section "升级检查"
+  printf '安装目录：%s\n' "$detected_dir"
+  install_dir="$(read_with_default "如需修改安装目录请输入新路径，直接回车继续: " "$detected_dir")"
   ensure_compose_dir "$install_dir"
 
+  container_exists "$CPA_CONTAINER" || die "未检测到 $CPA_CONTAINER，无法执行升级"
+  container_exists "$CPAM_CONTAINER" || die "未检测到 $CPAM_CONTAINER，无法执行升级"
+
+  cpa_target_ref="$(docker inspect -f '{{.Config.Image}}' "$CPA_CONTAINER" 2>/dev/null || true)"
+  manager_target_ref="$(docker inspect -f '{{.Config.Image}}' "$CPAM_CONTAINER" 2>/dev/null || true)"
+  cpa_current_id="$(container_image_id "$CPA_CONTAINER")"
+  manager_current_id="$(container_image_id "$CPAM_CONTAINER")"
+  [ -n "$cpa_target_ref" ] && [ -n "$manager_target_ref" ] || die "无法读取当前容器镜像配置"
+  [ -n "$cpa_current_id" ] && [ -n "$manager_current_id" ] || die "无法读取当前容器镜像 ID"
+
+  printf '\n正在检查镜像仓库，请稍候...\n'
+  pull_image_quietly "$cpa_target_ref" || die "CLIProxyAPI 最新镜像检查失败"
+  pull_image_quietly "$manager_target_ref" || die "CPA Manager Plus 最新镜像检查失败"
+
+  cpa_target_id="$(image_ref_id "$cpa_target_ref")"
+  manager_target_id="$(image_ref_id "$manager_target_ref")"
+  [ -n "$cpa_target_id" ] && [ -n "$manager_target_id" ] || die "最新镜像下载完成，但无法读取镜像 ID"
+
+  [ "$cpa_current_id" != "$cpa_target_id" ] && cpa_changed="true"
+  [ "$manager_current_id" != "$manager_target_id" ] && manager_changed="true"
+  cpa_current_version="$(image_display_version "$cpa_current_id" "$cpa_target_ref")"
+  manager_current_version="$(image_display_version "$manager_current_id" "$manager_target_ref")"
+  cpa_target_version="$(image_display_version "$cpa_target_id" "$cpa_target_ref")"
+  manager_target_version="$(image_display_version "$manager_target_id" "$manager_target_ref")"
+
+  print_section "版本对比"
+  print_upgrade_service "CLIProxyAPI" "$cpa_current_version" "$cpa_target_version" "$cpa_changed"
+  printf '\n'
+  print_upgrade_service "CPA Manager Plus" "$manager_current_version" "$manager_target_version" "$manager_changed"
+
+  if [ "$cpa_changed" = "false" ] && [ "$manager_changed" = "false" ]; then
+    printf '\n%b  当前两个服务均为最新镜像。%b\n' "$ICON_OK" "$COLOR_RESET"
+    if ! ask_yes_no "是否仍要重新创建容器" "N"; then
+      log "无需升级，已返回"
+      return 0
+    fi
+  fi
+
   backup_file="$install_dir/backups/pre-upgrade-$(timestamp).tar.gz"
+  print_section "升级确认"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '升级备份：%s\n' "$backup_file"
+  printf '影响范围：备份期间 CPA 和 Manager 会短暂停止；随后重新创建容器。\n'
+  printf '数据策略：保留 config.yaml、auths、日志和 cpa-manager-data。\n'
+  if ! ask_yes_no "已核对版本和影响，确认开始升级" "N"; then
+    log "已取消升级；已下载的镜像不会影响当前运行容器"
+    return 0
+  fi
+
   create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data || die "升级前一致性备份失败: $backup_file"
 
-  log "升级 CPA + CPA Manager Plus"
-  compose_in_dir "$install_dir" pull || die "docker compose pull 失败"
-  compose_in_dir "$install_dir" up -d || die "docker compose up -d 失败"
+  log "应用已确认的镜像并重新创建服务"
+  compose_in_dir "$install_dir" up -d --remove-orphans || die "docker compose up -d 失败；请使用升级前备份排查恢复"
   sleep 8
-  show_all_containers
+  show_menu_status
   health_check "$install_dir"
 }
 
@@ -1041,21 +1193,40 @@ start_cpa_cpam() {
   local install_dir
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
+  print_section "启动服务"
+  printf '安装目录：%s\n' "$install_dir"
   compose_in_dir "$install_dir" up -d || die "启动失败"
+  show_menu_status
 }
 
 stop_cpa_cpam() {
   local install_dir
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
+  print_section "停止确认"
+  show_menu_status
+  printf '\n影响：CPA API 和 Manager 将停止对外服务，数据不会删除。\n'
+  if ! ask_yes_no "确认停止全部服务" "N"; then
+    log "已取消停止"
+    return 0
+  fi
   compose_in_dir "$install_dir" stop || die "停止失败"
+  show_menu_status
 }
 
 restart_cpa_cpam() {
   local install_dir
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
+  print_section "重启确认"
+  show_menu_status
+  printf '\n影响：CPA API 和 Manager 会短暂中断，数据不会删除。\n'
+  if ! ask_yes_no "确认重启全部服务" "N"; then
+    log "已取消重启"
+    return 0
+  fi
   compose_in_dir "$install_dir" restart || die "重启失败"
+  show_menu_status
 }
 
 status_cpa_cpam() {
@@ -1067,16 +1238,13 @@ status_cpa_cpam() {
   cpa_host_port="$(detect_cpa_port "$install_dir")"
   cpam_host_port="$(detect_cpam_port "$install_dir")"
 
-  cat <<EOF
-检测到的安装目录: $install_dir
-安装类型: $(detect_install_type)
-CPA 端口: $cpa_host_port
-Manager 端口: $cpam_host_port
-
-容器状态:
-EOF
-  show_all_containers
-  printf '\n健康检查结果:\n'
+  print_section "部署信息"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '安装类型：%s\n' "$(detect_install_type)"
+  printf 'CPA 端口：%s\n' "$cpa_host_port"
+  printf 'Manager 端口：%s\n' "$cpam_host_port"
+  show_menu_status
+  print_section "健康检查"
   health_check "$install_dir" "" "$cpa_host_port" "$cpam_host_port"
 }
 
@@ -1120,6 +1288,15 @@ backup_cpa_cpam() {
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
   backup_file="$install_dir/backups/cpa-cpam-backup-$(timestamp).tar.gz"
+  print_section "备份确认"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '备份文件：%s\n' "$backup_file"
+  printf '包含内容：Compose、配置、密钥、认证、日志和 Manager 数据。\n'
+  printf '影响：为保证一致性，CPA 和 Manager 会短暂停止并自动恢复。\n'
+  if ! ask_yes_no "确认创建一致性备份" "N"; then
+    log "已取消备份"
+    return 0
+  fi
   create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths logs cpa-manager-data || die "一致性备份失败: $backup_file"
 }
 
@@ -1176,6 +1353,10 @@ uninstall_cpa_cpam() {
   detected_dir="$(detect_install_dir)"
   install_dir="$(read_with_default "安装目录，回车使用检测值 [$detected_dir]: " "$detected_dir")"
 
+  print_section "卸载确认"
+  printf '安装目录：%s\n' "$install_dir"
+  show_menu_status
+  printf '\n第一步会停止并删除 Compose 容器和网络，不会立即删除数据目录。\n'
   if ! ask_yes_no "确认卸载 CPA + CPA Manager Plus" "N"; then
     log "已取消卸载"
     return 0
@@ -1211,6 +1392,135 @@ docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-l
 
 按提示在你本地电脑执行它给出的 ssh -L 隧道命令，然后用本地浏览器打开授权链接。
 EOF
+}
+
+# 从最近 24 小时的容器日志和文件日志中提取全局可路由 IP，并按出现次数排序。
+collect_recent_access_ips() {
+  local install_dir="$1"
+  local log_sample="$2"
+  local python_bin="${PYTHON_BIN:-python3}"
+
+  : > "$log_sample"
+  if container_exists "$CPA_CONTAINER"; then
+    docker logs --since 24h "$CPA_CONTAINER" >> "$log_sample" 2>&1 || true
+  fi
+
+  if [ -d "$install_dir/logs" ]; then
+    while IFS= read -r -d '' log_file; do
+      tail -n 50000 "$log_file" >> "$log_sample" 2>/dev/null || true
+    done < <(find "$install_dir/logs" -type f -mmin -1440 -print0 2>/dev/null)
+  fi
+
+  if ! "$python_bin" -c 'import ipaddress' >/dev/null 2>&1; then
+    err "无法执行 Python IP 解析器: $python_bin"
+    return 1
+  fi
+
+  "$python_bin" - "$log_sample" <<'PY'
+import collections
+import ipaddress
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, "r", encoding="utf-8", errors="ignore").read()
+patterns = [
+    r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])",
+    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])",
+]
+counts = collections.Counter()
+for pattern in patterns:
+    for candidate in re.findall(pattern, text):
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.is_global:
+            counts[str(address)] += 1
+
+for address, count in counts.most_common(30):
+    print(f"{count}\t{address}")
+PY
+}
+
+show_ippure_info() {
+  local response
+  local risk
+  local native
+  local datacenter
+
+  print_section "服务器出口 IP 信息（IPPure）"
+  printf '隐私提示：调用 IPPure 时，对方会收到本机出口 IP 和 curl User-Agent。\n'
+  if ! ask_yes_no "确认调用 https://my.ippure.com/v1/info" "N"; then
+    log "已跳过 IPPure 查询"
+    return 0
+  fi
+
+  if ! response="$(curl -fsSL --max-time 15 https://my.ippure.com/v1/info 2>/dev/null)"; then
+    warn "IPPure API 请求失败"
+    return 1
+  fi
+  if ! jq -e . >/dev/null 2>&1 <<<"$response"; then
+    warn "IPPure API 返回的不是有效 JSON"
+    return 1
+  fi
+
+  printf 'IP：%s\n' "$(jq -r '.ip // "未返回"' <<<"$response")"
+  printf 'ASN：%s\n' "$(jq -r '.asn // "未返回"' <<<"$response")"
+  printf '运营组织：%s\n' "$(jq -r '.asOrganization // .organization // "未返回"' <<<"$response")"
+  printf '位置：%s\n' "$(jq -r '[.country, .region, .city] | map(select(. != null and . != "")) | join(" / ") | if . == "" then "未返回" else . end' <<<"$response")"
+  printf '时区：%s\n' "$(jq -r '.timezone // "未返回"' <<<"$response")"
+  printf '经纬度：%s\n' "$(jq -r 'if .longitude and .latitude then "\(.longitude), \(.latitude)" else "未返回" end' <<<"$response")"
+
+  risk="$(jq -r '.riskScore // .riskCoefficient // .risk // .fraudScore // empty' <<<"$response")"
+  native="$(jq -r '.isNative // .native // empty' <<<"$response")"
+  datacenter="$(jq -r '.isDataCenter // .datacenter // .isHosting // empty' <<<"$response")"
+  printf '风险系数：%s\n' "${risk:-接口未返回}"
+  printf '原生 IP：%s\n' "${native:-接口未返回}"
+  printf '机房 IP：%s\n' "${datacenter:-接口未返回}"
+}
+
+security_audit() {
+  local install_dir
+  local temp_dir
+  local log_sample
+  local ip_report
+  local auth_failures
+  local total_sources
+
+  install_dir="$(detect_install_dir)"
+  temp_dir="$(mktemp -d)"
+  log_sample="$temp_dir/log-sample.txt"
+  ip_report="$temp_dir/ip-report.tsv"
+
+  print_section "24 小时访问来源巡检"
+  printf '说明：结果来自现有日志，是辅助安全线索，不等同于入侵结论。\n'
+  printf '时间范围：最近 24 小时\n'
+  printf '安装目录：%s\n' "$install_dir"
+
+  if ! collect_recent_access_ips "$install_dir" "$log_sample" > "$ip_report"; then
+    rm -rf "$temp_dir"
+    die "无法解析最近 24 小时访问 IP"
+  fi
+  auth_failures="$(grep -Eic '(^|[^0-9])(401|403)([^0-9]|$)|unauthorized|forbidden|invalid.*(key|token)|authentication failed' "$log_sample" 2>/dev/null || true)"
+  total_sources="$(wc -l < "$ip_report" | tr -d ' ')"
+
+  printf '\n公开来源 IP：%s 个\n' "$total_sources"
+  if [ "$auth_failures" -gt 0 ]; then
+    printf '疑似鉴权失败日志：%b  %s 条，请结合日志复核\n' "$ICON_WARN" "$auth_failures"
+  else
+    printf '疑似鉴权失败日志：%b  未发现\n' "$ICON_OK"
+  fi
+  if [ -s "$ip_report" ]; then
+    printf '\n%-10s %s\n' '出现次数' 'IP 地址'
+    printf '%s\n' '────────────────────────────────────────────────────────'
+    awk -F '\t' '{ printf "%-10s %s\n", $1, $2 }' "$ip_report"
+  else
+    printf '%b  日志中未提取到公开来源 IP；可能是日志格式未记录客户端地址。\n' "$ICON_WARN"
+  fi
+
+  rm -rf "$temp_dir"
+  show_ippure_info || warn "IPPure 查询未完成，本地 24 小时巡检结果仍然有效"
 }
 
 # -----------------------------------------------------------------------------
@@ -1409,8 +1719,8 @@ EOF
   mv -f "$temp_compose" "$install_dir/docker-compose.yml"
   upsert_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" "$cpamp_admin_key"
 
-  log "拉取并启动 CPA Manager Plus"
-  if ! compose_in_dir "$install_dir" pull cpa-manager-plus || ! compose_in_dir "$install_dir" up -d --no-deps cpa-manager-plus; then
+  log "检查并启动 CPA Manager Plus"
+  if ! pull_image_quietly "$CPAM_IMAGE" || ! compose_in_dir "$install_dir" up -d --no-deps cpa-manager-plus; then
     warn "Plus 启动失败，开始自动回滚"
     rollback_from_snapshot "$install_dir" "$snapshot_dir"
     return 1
@@ -1447,6 +1757,7 @@ print_help() {
   preflight  只读检查当前安装和迁移条件
   migrate    正式迁移旧 Manager（可加 --dry-run）
   rollback   回滚最近一次迁移
+  security   查看 24 小时访问 IP 和服务器出口 IP 信息
   start      启动
   stop       停止
   restart    重启
@@ -1461,10 +1772,12 @@ print_help() {
   INSTALL_DIR=/opt/cliproxy-cpam
   CPA_HOST_PORT=8317
   CPAM_HOST_PORT=18317
+  CPA_IMAGE=eceasy/cli-proxy-api:latest
   API_KEY=sk-cpa-xxx
   MGT_KEY=mgt-cpa-xxx
   CPAMP_ADMIN_KEY=cpamp_xxx
   CPAM_IMAGE=seakee/cpa-manager-plus:latest
+  ASSUME_YES=0
 EOF
 }
 
@@ -1491,12 +1804,12 @@ CPA Manager Plus 运维控制台
  13) 正式迁移到 Plus        14) 回滚最近迁移
 
 其他
- 15) 卸载
+ 15) 安全巡检 / 24h IP      16) 卸载
 
   0) 退出
 ────────────────────────────────────────────────────────
 EOF
-    printf "请选择操作 [0-15]: "
+    printf "请选择操作 [0-16]: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -1513,7 +1826,8 @@ EOF
       12) migrate_dry_run ;;
       13) migrate_cpa_cpam ;;
       14) rollback_cpa_cpam ;;
-      15) uninstall_cpa_cpam ;;
+      15) security_audit ;;
+      16) uninstall_cpa_cpam ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
@@ -1556,7 +1870,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|logs|backup|keys|uninstall|codex-login)
+    menu|install|upgrade|start|stop|restart|status|logs|backup|keys|uninstall|codex-login|security)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -1579,6 +1893,7 @@ main() {
     keys) show_keys ;;
     uninstall) uninstall_cpa_cpam ;;
     codex-login) codex_login_hint ;;
+    security) security_audit ;;
   esac
 }
 

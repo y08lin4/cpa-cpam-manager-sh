@@ -28,17 +28,25 @@ printf '[2/3] Git 空白错误检查\n'
 
 printf '[3/3] ShellCheck\n'
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck "$SCRIPT_FILE" "$ROOT_DIR/scripts/check.sh"
+  shellcheck -x "$SCRIPT_FILE" "$ROOT_DIR"/scripts/*.sh
 else
   printf '未安装 shellcheck，已跳过；CI 会执行该检查。\n'
 fi
 
-printf '[附加 1/2] 终端界面模拟检查\n'
+printf '[附加 1/4] 终端界面模拟检查\n'
 bash "$ROOT_DIR/scripts/test-terminal-ui.sh" >/dev/null
 printf '终端界面模拟检查通过。\n'
 
-printf '[附加 2/2] 一致性备份模拟检查\n'
+printf '[附加 2/4] 一致性备份模拟检查\n'
 bash "$ROOT_DIR/scripts/test-consistent-backup.sh" >/dev/null
 printf '一致性备份模拟检查通过。\n'
+
+printf '[附加 3/4] 升级版本展示模拟检查\n'
+bash "$ROOT_DIR/scripts/test-upgrade-version.sh" >/dev/null
+printf '升级版本展示模拟检查通过。\n'
+
+printf '[附加 4/4] 安全巡检 IP 提取模拟检查\n'
+bash "$ROOT_DIR/scripts/test-security-audit.sh" >/dev/null
+printf '安全巡检 IP 提取模拟检查通过。\n'
 
 printf '静态检查完成。\n'

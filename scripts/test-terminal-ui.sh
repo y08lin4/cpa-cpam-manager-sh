@@ -6,6 +6,7 @@ export PATH="/usr/bin:/bin:/mingw64/bin:/cmd:${PATH:-}"
 
 # 使用模拟 Docker 输出检查终端状态卡，不需要本机运行 Docker daemon。
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../cpa-cpam-manager.sh
 NO_COLOR=1 source "$ROOT_DIR/cpa-cpam-manager.sh"
 
 container_exists() {

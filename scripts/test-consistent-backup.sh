@@ -5,6 +5,7 @@ export PATH="/usr/bin:/bin:/mingw64/bin:/cmd:${PATH:-}"
 
 # 模拟运行中的 CPA 与 Manager，验证一致性备份的停机和恢复顺序。
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../cpa-cpam-manager.sh
 NO_COLOR=1 source "$ROOT_DIR/cpa-cpam-manager.sh"
 
 TEMP_DIR="$(mktemp -d)"
