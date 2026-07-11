@@ -33,8 +33,12 @@ else
   printf '未安装 shellcheck，已跳过；CI 会执行该检查。\n'
 fi
 
-printf '[附加] 终端界面模拟检查\n'
+printf '[附加 1/2] 终端界面模拟检查\n'
 bash "$ROOT_DIR/scripts/test-terminal-ui.sh" >/dev/null
 printf '终端界面模拟检查通过。\n'
+
+printf '[附加 2/2] 一致性备份模拟检查\n'
+bash "$ROOT_DIR/scripts/test-consistent-backup.sh" >/dev/null
+printf '一致性备份模拟检查通过。\n'
 
 printf '静态检查完成。\n'

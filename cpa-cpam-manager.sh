@@ -715,8 +715,62 @@ create_backup_archive() {
     return 0
   fi
 
-  (cd "$install_dir" && tar -czf "$backup_file" "${items[@]}") || die "备份失败: $backup_file"
+  if ! (cd "$install_dir" && tar -czf "$backup_file" "${items[@]}"); then
+    rm -f "$backup_file"
+    return 1
+  fi
   log "备份完成: $backup_file"
+}
+
+# Manager 运行时会持续写入 SQLite。备份前短暂停止 Manager，并在任何结果下恢复原运行状态。
+create_consistent_backup_archive() {
+  local install_dir="$1"
+  local backup_file="$2"
+  local scope="$3"
+  shift 3
+  local manager_container
+  local running_containers=()
+  local container
+  local backup_ok="true"
+  local restart_ok="true"
+
+  manager_container="$(active_cpam_container)"
+  if container_exists "$manager_container" &&
+     [ "$(docker inspect -f '{{.State.Running}}' "$manager_container" 2>/dev/null || true)" = "true" ]; then
+    running_containers+=("$manager_container")
+    log "暂停 $manager_container 以创建一致性备份"
+    docker stop "$manager_container" >/dev/null || return 1
+  fi
+
+  if [ "$scope" = "all" ] && container_exists "$CPA_CONTAINER" &&
+     [ "$(docker inspect -f '{{.State.Running}}' "$CPA_CONTAINER" 2>/dev/null || true)" = "true" ]; then
+    log "暂停 $CPA_CONTAINER 以冻结认证和日志数据"
+    if ! docker stop "$CPA_CONTAINER" >/dev/null; then
+      for container in "${running_containers[@]}"; do
+        docker start "$container" >/dev/null 2>&1 || true
+      done
+      return 1
+    fi
+    running_containers+=("$CPA_CONTAINER")
+  fi
+
+  if ! create_backup_archive "$install_dir" "$backup_file" "$@"; then
+    backup_ok="false"
+  elif ! verify_backup_archive "$backup_file"; then
+    rm -f "$backup_file"
+    backup_ok="false"
+  fi
+
+  for (( container=${#running_containers[@]}-1; container>=0; container-- )); do
+    if docker start "${running_containers[$container]}" >/dev/null; then
+      log "${running_containers[$container]} 已恢复运行"
+    else
+      restart_ok="false"
+      err "${running_containers[$container]} 恢复启动失败，请立即手动启动"
+    fi
+  done
+
+  [ "$backup_ok" = "true" ] && [ "$restart_ok" = "true" ]
 }
 
 health_check() {
@@ -973,7 +1027,7 @@ upgrade_cpa_cpam() {
   ensure_compose_dir "$install_dir"
 
   backup_file="$install_dir/backups/pre-upgrade-$(timestamp).tar.gz"
-  create_backup_archive "$install_dir" "$backup_file" docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data
+  create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data || die "升级前一致性备份失败: $backup_file"
 
   log "升级 CPA + CPA Manager Plus"
   compose_in_dir "$install_dir" pull || die "docker compose pull 失败"
@@ -1066,7 +1120,7 @@ backup_cpa_cpam() {
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
   backup_file="$install_dir/backups/cpa-cpam-backup-$(timestamp).tar.gz"
-  create_backup_archive "$install_dir" "$backup_file" docker-compose.yml config.yaml .secrets.txt auths logs cpa-manager-data
+  create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths logs cpa-manager-data || die "一致性备份失败: $backup_file"
 }
 
 show_keys() {
@@ -1333,7 +1387,10 @@ migrate_cpa_cpam() {
 
   log "停止旧 CPA-Manager 以创建一致性 SQLite 备份"
   docker stop "$LEGACY_CPAM_CONTAINER" >/dev/null || die "停止旧 CPA-Manager 失败"
-  create_backup_archive "$install_dir" "$backup_file" docker-compose.yml .secrets.txt cpa-manager-data
+  if ! create_backup_archive "$install_dir" "$backup_file" docker-compose.yml .secrets.txt cpa-manager-data; then
+    docker start "$LEGACY_CPAM_CONTAINER" >/dev/null || true
+    die "迁移前备份失败，旧 Manager 已尝试恢复"
+  fi
   if ! verify_backup_archive "$backup_file"; then
     docker start "$LEGACY_CPAM_CONTAINER" >/dev/null || true
     die "迁移备份校验失败，旧 Manager 已尝试恢复"
@@ -1367,8 +1424,9 @@ EOF
   fi
 
   docker rm "$LEGACY_CPAM_CONTAINER" >/dev/null || warn "旧 Manager 容器删除失败，请确认其保持停止"
-  create_backup_archive "$install_dir" "$snapshot_dir/post-migration.tar.gz" docker-compose.yml .secrets.txt cpa-manager-data
-  verify_backup_archive "$snapshot_dir/post-migration.tar.gz" || warn "迁移后备份校验失败，请立即手工备份"
+  if ! create_consistent_backup_archive "$install_dir" "$snapshot_dir/post-migration.tar.gz" manager docker-compose.yml .secrets.txt cpa-manager-data; then
+    warn "迁移已成功，但迁移后备份失败；Plus 已尝试恢复运行，请稍后执行 backup"
+  fi
   log "迁移成功。访问地址和端口保持不变: http://服务器IP:${cpam_host_port}/management.html"
   log "如需回滚，请运行: bash cpa-cpam-manager.sh rollback"
 }

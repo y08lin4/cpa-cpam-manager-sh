@@ -17,7 +17,7 @@
 bash scripts/check.sh
 ```
 
-基础检查包括 Bash 语法、Git 空白错误、终端界面模拟和 ShellCheck。ShellCheck 在本机已安装时执行，在 CI 中强制执行。
+基础检查包括 Bash 语法、Git 空白错误、终端界面模拟、一致性备份模拟和 ShellCheck。ShellCheck 在本机已安装时执行，在 CI 中强制执行。
 
 ## 提交要求
 

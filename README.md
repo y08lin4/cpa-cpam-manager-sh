@@ -293,6 +293,8 @@ bash cpa-cpam-manager.sh logs
 bash cpa-cpam-manager.sh backup
 ```
 
+为避免 SQLite、认证文件或日志在打包过程中发生变化，脚本会短暂停止 Manager 和 CLIProxyAPI，完成归档与可读性校验后自动恢复原运行状态。迁移后的补充快照只暂停 Manager，不影响 CPA API。
+
 常规备份路径：
 
 ```text
