@@ -14,17 +14,66 @@ CPA_INTERNAL_PORT="8317"
 CPAM_INTERNAL_PORT="18317"
 CPA_MANAGER_SETUP_UPSTREAM="http://cli-proxy-api:8317"
 
+# 终端配色。设置 NO_COLOR=1 时关闭颜色，兼容不支持 ANSI 的终端和日志采集场景。
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  COLOR_GREEN='\033[1;32m'
+  COLOR_YELLOW='\033[1;33m'
+  COLOR_RED='\033[1;31m'
+  COLOR_CYAN='\033[1;36m'
+  COLOR_BOLD='\033[1m'
+  COLOR_RESET='\033[0m'
+else
+  COLOR_GREEN=''
+  COLOR_YELLOW=''
+  COLOR_RED=''
+  COLOR_CYAN=''
+  COLOR_BOLD=''
+  COLOR_RESET=''
+fi
+
+ICON_OK="${COLOR_GREEN}✓${COLOR_RESET}"
+ICON_WARN="${COLOR_YELLOW}!${COLOR_RESET}"
+ICON_ERROR="${COLOR_RED}✗${COLOR_RESET}"
+
+# -----------------------------------------------------------------------------
+# 基础输出与交互
+# -----------------------------------------------------------------------------
+
 log() {
-  printf '\033[1;32m[INFO]\033[0m %s\n' "$*"
+  printf '%b[INFO]%b %s\n' "$COLOR_GREEN" "$COLOR_RESET" "$*"
 }
 
 warn() {
-  printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2
+  printf '%b[WARN]%b %s\n' "$COLOR_YELLOW" "$COLOR_RESET" "$*" >&2
 }
 
 err() {
-  printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2
+  printf '%b[ERROR]%b %s\n' "$COLOR_RED" "$COLOR_RESET" "$*" >&2
 }
+
+# 输出统一的区块标题，避免状态、预检和菜单内容挤在一起。
+print_section() {
+  local title="$1"
+  printf '\n%b%s%b\n' "$COLOR_BOLD$COLOR_CYAN" "$title" "$COLOR_RESET"
+  printf '%s\n' '────────────────────────────────────────────────────────'
+}
+
+clear_screen() {
+  if [ -t 1 ]; then
+    printf '\033[2J\033[H'
+  fi
+}
+
+pause_before_menu() {
+  if [ -t 0 ]; then
+    printf '\n按 Enter 返回主菜单...'
+    read -r _ || true
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 系统依赖与 Docker 环境
+# -----------------------------------------------------------------------------
 
 die() {
   err "$*"
@@ -152,7 +201,7 @@ install_docker() {
 
 ensure_docker_interactive() {
   if command -v docker >/dev/null 2>&1; then
-    docker --version || true
+    docker --version >/dev/null 2>&1 || true
   else
     if ask_yes_no "未检测到 Docker，是否现在安装 Docker" "Y"; then
       install_docker
@@ -172,7 +221,6 @@ ensure_docker_interactive() {
   docker info >/dev/null 2>&1 || die "Docker daemon 不正常，请检查 Docker 服务"
 
   if docker compose version >/dev/null 2>&1; then
-    docker compose version
     return 0
   fi
 
@@ -182,7 +230,7 @@ ensure_docker_interactive() {
   apt-get update
   apt-get install -y docker-compose-plugin
   docker compose version >/dev/null 2>&1 || die "docker compose 不可用，请手动检查 Docker Compose 插件"
-  docker compose version
+  log "Docker Compose 插件安装完成"
 }
 
 generate_hex() {
@@ -192,6 +240,10 @@ generate_hex() {
     od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
   fi
 }
+
+# -----------------------------------------------------------------------------
+# 密钥、配置值与服务器信息
+# -----------------------------------------------------------------------------
 
 generate_api_key() {
   printf 'sk-cpa-%s\n' "$(generate_hex)"
@@ -230,6 +282,10 @@ load_secrets_value() {
   awk -v key="$key" 'BEGIN { FS="=" } $1 == key { sub(/^[^=]*=/, ""); print; exit }' "$secrets_file"
 }
 
+# -----------------------------------------------------------------------------
+# 安装识别与终端状态展示
+# -----------------------------------------------------------------------------
+
 container_exists() {
   local name="$1"
   docker ps -a --format '{{.Names}}' | grep -Fxq "$name"
@@ -265,46 +321,78 @@ detect_install_type() {
   fi
 }
 
-container_status_line() {
+container_primary_port() {
+  local name="$1"
+  local internal_port="$2"
+  local mapping
+  mapping="$(docker port "$name" "${internal_port}/tcp" 2>/dev/null | head -n 1 || true)"
+  if [ -n "$mapping" ]; then
+    printf '%s\n' "${mapping##*:}"
+  else
+    printf '%s\n' "未映射"
+  fi
+}
+
+# 使用多行状态卡代替 Docker 原始端口列表，避免在窄终端中产生超长横向输出。
+container_status_card() {
   local name="$1"
   local label="$2"
+  local internal_port="$3"
+  local legacy="${4:-false}"
   local image
   local state
-  local ports
+  local port
+  local icon
+  local state_text
 
   if ! container_exists "$name"; then
-    printf '  %-18s 未安装\n' "$label"
+    printf '%b  %b%s%b\n' "$ICON_WARN" "$COLOR_YELLOW" "$label" "$COLOR_RESET"
+    printf '   状态：%b未安装%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
     return 0
   fi
 
   image="$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || printf '未知')"
   state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || printf '未知')"
-  ports="$(docker port "$name" 2>/dev/null | paste -sd ',' - || true)"
-  [ -n "$ports" ] || ports="无端口映射"
-  printf '  %-18s %-8s 镜像/版本: %s  端口: %s\n' "$label" "$state" "$image" "$ports"
+  port="$(container_primary_port "$name" "$internal_port")"
+
+  case "$state" in
+    running) icon="$ICON_OK"; state_text="${COLOR_GREEN}运行中${COLOR_RESET}" ;;
+    exited|dead) icon="$ICON_ERROR"; state_text="${COLOR_RED}已停止${COLOR_RESET}" ;;
+    *) icon="$ICON_WARN"; state_text="${COLOR_YELLOW}${state}${COLOR_RESET}" ;;
+  esac
+
+  printf '%b  %b%s%b\n' "$icon" "$COLOR_BOLD" "$label" "$COLOR_RESET"
+  printf '   状态：%b\n' "$state_text"
+  printf '   镜像：%s\n' "$image"
+  printf '   端口：%s -> %s/tcp\n' "$port" "$internal_port"
+  if [ "$legacy" = "true" ]; then
+    printf '   提示：%b旧版服务，建议执行迁移预检%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
+  fi
 }
 
 show_menu_status() {
-  printf '\n当前运行状态:\n'
+  print_section "服务状态"
   if ! command -v docker >/dev/null 2>&1; then
-    printf '  Docker             未安装\n'
+    printf '%b  Docker 未安装\n' "$ICON_WARN"
     return 0
   fi
   if ! docker info >/dev/null 2>&1; then
-    printf '  Docker             daemon 未运行\n'
+    printf '%b  Docker daemon 未运行\n' "$ICON_ERROR"
     return 0
   fi
 
-  container_status_line "$CPA_CONTAINER" "CLIProxyAPI"
+  container_status_card "$CPA_CONTAINER" "CLIProxyAPI" "$CPA_INTERNAL_PORT"
+  printf '\n'
   if container_exists "$CPAM_CONTAINER"; then
-    container_status_line "$CPAM_CONTAINER" "CPA Manager Plus"
+    container_status_card "$CPAM_CONTAINER" "CPA Manager Plus" "$CPAM_INTERNAL_PORT"
   elif container_exists "$LEGACY_CPAM_CONTAINER"; then
-    container_status_line "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager"
+    container_status_card "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager" "$CPAM_INTERNAL_PORT" "true"
   else
-    container_status_line "$CPAM_CONTAINER" "CPA Manager Plus"
+    container_status_card "$CPAM_CONTAINER" "CPA Manager Plus" "$CPAM_INTERNAL_PORT"
   fi
   if container_exists "$CPAM_CONTAINER" && container_exists "$LEGACY_CPAM_CONTAINER"; then
-    container_status_line "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager"
+    printf '\n'
+    container_status_card "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager" "$CPAM_INTERNAL_PORT" "true"
     warn "同时检测到新旧 Manager，避免让两者消费同一个用量队列"
   fi
 }
@@ -312,6 +400,10 @@ show_menu_status() {
 show_all_containers() {
   docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 }
+
+# -----------------------------------------------------------------------------
+# 端口、Compose 与安装文件
+# -----------------------------------------------------------------------------
 
 detect_install_dir() {
   local env_install_dir="${INSTALL_DIR:-}"
@@ -600,6 +692,10 @@ prepare_install_dir() {
   mkdir -p "$install_dir/auths" "$install_dir/logs" "$install_dir/cpa-manager-data" "$install_dir/backups"
 }
 
+# -----------------------------------------------------------------------------
+# 备份、健康检查与迁移校验
+# -----------------------------------------------------------------------------
+
 create_backup_archive() {
   local install_dir="$1"
   local backup_file="$2"
@@ -773,6 +869,10 @@ CPA 地址: $CPA_MANAGER_SETUP_UPSTREAM
 CPA Management Key: $mgt_key
 EOF
 }
+
+# -----------------------------------------------------------------------------
+# 安装、升级与日常运维命令
+# -----------------------------------------------------------------------------
 
 install_cpa_cpam() {
   local install_dir_default="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
@@ -1059,6 +1159,10 @@ docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-l
 EOF
 }
 
+# -----------------------------------------------------------------------------
+# 旧 CPA-Manager 到 Plus 的迁移与回滚
+# -----------------------------------------------------------------------------
+
 preflight_cpa_cpam() {
   local install_type
   local install_dir
@@ -1066,7 +1170,7 @@ preflight_cpa_cpam() {
   local data_source
   local image
 
-  printf 'CPA Manager Plus 迁移预检（只读）\n\n'
+  print_section "迁移预检（只读）"
   if ! command -v docker >/dev/null 2>&1; then
     printf 'Docker: 未安装\n安装类型: not-installed\n'
     return 1
@@ -1079,23 +1183,27 @@ preflight_cpa_cpam() {
   install_type="$(detect_install_type)"
   install_dir="$(detect_install_dir)"
   manager_container="$(active_cpam_container)"
-  printf '安装类型: %s\n安装目录: %s\n' "$install_type" "$install_dir"
+  printf '安装类型：%b%s%b\n' "$COLOR_BOLD" "$install_type" "$COLOR_RESET"
+  printf '安装目录：%s\n' "$install_dir"
   show_menu_status
 
   if container_exists "$manager_container"; then
     image="$(docker inspect -f '{{.Config.Image}}' "$manager_container" 2>/dev/null || true)"
     data_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$manager_container" 2>/dev/null || true)"
-    printf '\nManager 容器: %s\nManager 镜像: %s\n/data 来源: %s\n' "$manager_container" "${image:-未知}" "${data_source:-未检测到}"
+    print_section "迁移数据"
+    printf 'Manager 容器：%s\n' "$manager_container"
+    printf 'Manager 镜像：%s\n' "${image:-未知}"
+    printf '/data 来源：%s\n' "${data_source:-未检测到}"
   fi
 
   if [ -f "$install_dir/config.yaml" ]; then
     if grep -Eq '^[[:space:]]*usage-statistics-enabled:[[:space:]]*true' "$install_dir/config.yaml"; then
-      printf '用量统计: 已启用\n'
+      printf '%b  用量统计已启用\n' "$ICON_OK"
     else
       warn "config.yaml 未确认启用 usage-statistics-enabled"
     fi
     if grep -Eq '^[[:space:]]*allow-remote:[[:space:]]*true' "$install_dir/config.yaml"; then
-      printf '远程管理: 已启用\n'
+      printf '%b  远程管理已启用\n' "$ICON_OK"
     else
       warn "config.yaml 未确认启用 remote-management.allow-remote"
     fi
@@ -1104,8 +1212,14 @@ preflight_cpa_cpam() {
   fi
 
   case "$install_type" in
-    legacy) printf '\n结论: 可进入迁移准备；正式迁移前需停止旧 Manager 并创建一致性备份。\n' ;;
-    plus) printf '\n结论: 当前已经是 CPA Manager Plus，无需迁移。\n' ;;
+    legacy)
+      print_section "预检结论"
+      printf '%b  可进入迁移准备。正式迁移会停止旧 Manager 并创建一致性备份。\n' "$ICON_OK"
+      ;;
+    plus)
+      print_section "预检结论"
+      printf '%b  当前已经是 CPA Manager Plus，无需迁移。\n' "$ICON_OK"
+      ;;
     mixed)
       warn "结论: 同时存在新旧 Manager，已阻断迁移，请先确认唯一消费者"
       return 1
@@ -1259,28 +1373,9 @@ EOF
   log "如需回滚，请运行: bash cpa-cpam-manager.sh rollback"
 }
 
-migration_menu() {
-  local choice
-  cat <<'EOF'
-请选择迁移操作：
-1) 只读预检
-2) 查看迁移计划（dry-run）
-3) 正式迁移到 CPA Manager Plus
-4) 回滚最近一次迁移
-0) 返回
-EOF
-  printf "请输入选项 [1]: "
-  read -r choice || choice="1"
-  [ -n "$choice" ] || choice="1"
-  case "$choice" in
-    1) preflight_cpa_cpam ;;
-    2) migrate_dry_run ;;
-    3) migrate_cpa_cpam ;;
-    4) rollback_cpa_cpam ;;
-    0) return 0 ;;
-    *) warn "无效选项" ;;
-  esac
-}
+# -----------------------------------------------------------------------------
+# 帮助、一级菜单与命令入口
+# -----------------------------------------------------------------------------
 
 print_help() {
   cat <<'EOF'
@@ -1318,26 +1413,32 @@ EOF
 menu_loop() {
   local choice
   while true; do
+    clear_screen
     show_menu_status
     cat <<'EOF'
 
-CLIProxyAPI + CPA Manager Plus 运维脚本
+CPA Manager Plus 运维控制台
+────────────────────────────────────────────────────────
+部署管理
+  1) 安装 / 重装             2) 升级
+  3) 启动                     4) 停止
+  5) 重启                     6) 状态 / 健康检查
 
-1) 安装 / 重装 CPA + CPA Manager Plus
-2) 升级 CPA + CPA Manager Plus
-3) 启动
-4) 停止
-5) 重启
-6) 状态 / 健康检查
-7) 查看日志
-8) 备份
-9) 查看密钥 / 地址
-10) Codex OAuth 登录命令提示
-11) 卸载
-12) Plus 迁移 / 预检 / 回滚
-0) 退出
+运行维护
+  7) 查看日志                 8) 创建备份
+  9) 查看密钥 / 地址         10) Codex OAuth 登录
+
+数据与迁移
+ 11) 迁移预检               12) 查看迁移计划
+ 13) 正式迁移到 Plus        14) 回滚最近迁移
+
+其他
+ 15) 卸载
+
+  0) 退出
+────────────────────────────────────────────────────────
 EOF
-    printf "请输入选项: "
+    printf "请选择操作 [0-15]: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -1350,11 +1451,17 @@ EOF
       8) backup_cpa_cpam ;;
       9) show_keys ;;
       10) codex_login_hint ;;
-      11) uninstall_cpa_cpam ;;
-      12) migration_menu ;;
+      11) preflight_cpa_cpam ;;
+      12) migrate_dry_run ;;
+      13) migrate_cpa_cpam ;;
+      14) rollback_cpa_cpam ;;
+      15) uninstall_cpa_cpam ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
+    if [ "$choice" != "0" ]; then
+      pause_before_menu
+    fi
   done
 }
 

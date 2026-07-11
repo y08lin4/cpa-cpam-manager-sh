@@ -1,4 +1,4 @@
-name: shellcheck
+name: static-checks
 
 on:
   push:
@@ -6,12 +6,15 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
-  shellcheck:
+  static-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run shellcheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: "."
+      - name: 安装 ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: 执行项目静态检查
+        run: bash scripts/check.sh
