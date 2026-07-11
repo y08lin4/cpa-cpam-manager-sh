@@ -13,4 +13,3 @@ cpa-manager-data/
 
 # 本地静态检查与迁移演练产生的临时目录
 .tmp-*/
-%TMPDIR%/
