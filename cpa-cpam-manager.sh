@@ -5,10 +5,11 @@ DEFAULT_INSTALL_DIR="/opt/cliproxy-cpam"
 DEFAULT_CPA_HOST_PORT="8317"
 DEFAULT_CPAM_HOST_PORT="18317"
 CPA_IMAGE="eceasy/cli-proxy-api:latest"
-CPAM_IMAGE="seakee/cpa-manager:latest"
+CPAM_IMAGE="${CPAM_IMAGE:-seakee/cpa-manager-plus:latest}"
 OLD_PANEL_CONTAINER="cpa-management-center"
 CPA_CONTAINER="cli-proxy-api"
-CPAM_CONTAINER="cpa-manager"
+CPAM_CONTAINER="cpa-manager-plus"
+LEGACY_CPAM_CONTAINER="cpa-manager"
 CPA_INTERNAL_PORT="8317"
 CPAM_INTERNAL_PORT="18317"
 CPA_MANAGER_SETUP_UPSTREAM="http://cli-proxy-api:8317"
@@ -200,6 +201,10 @@ generate_mgt_key() {
   printf 'mgt-cpa-%s\n' "$(generate_hex)"
 }
 
+generate_cpamp_admin_key() {
+  printf 'cpamp_%s\n' "$(generate_hex)"
+}
+
 yaml_escape_double() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -230,6 +235,80 @@ container_exists() {
   docker ps -a --format '{{.Names}}' | grep -Fxq "$name"
 }
 
+active_cpam_container() {
+  if container_exists "$CPAM_CONTAINER"; then
+    printf '%s\n' "$CPAM_CONTAINER"
+  elif container_exists "$LEGACY_CPAM_CONTAINER"; then
+    printf '%s\n' "$LEGACY_CPAM_CONTAINER"
+  else
+    printf '%s\n' "$CPAM_CONTAINER"
+  fi
+}
+
+detect_install_type() {
+  local has_plus="false"
+  local has_legacy="false"
+
+  container_exists "$CPAM_CONTAINER" && has_plus="true"
+  container_exists "$LEGACY_CPAM_CONTAINER" && has_legacy="true"
+
+  if [ "$has_plus" = "true" ] && [ "$has_legacy" = "true" ]; then
+    printf 'mixed\n'
+  elif [ "$has_plus" = "true" ]; then
+    printf 'plus\n'
+  elif [ "$has_legacy" = "true" ]; then
+    printf 'legacy\n'
+  elif container_exists "$CPA_CONTAINER"; then
+    printf 'cpa-only\n'
+  else
+    printf 'not-installed\n'
+  fi
+}
+
+container_status_line() {
+  local name="$1"
+  local label="$2"
+  local image
+  local state
+  local ports
+
+  if ! container_exists "$name"; then
+    printf '  %-18s 未安装\n' "$label"
+    return 0
+  fi
+
+  image="$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || printf '未知')"
+  state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || printf '未知')"
+  ports="$(docker port "$name" 2>/dev/null | paste -sd ',' - || true)"
+  [ -n "$ports" ] || ports="无端口映射"
+  printf '  %-18s %-8s 镜像/版本: %s  端口: %s\n' "$label" "$state" "$image" "$ports"
+}
+
+show_menu_status() {
+  printf '\n当前运行状态:\n'
+  if ! command -v docker >/dev/null 2>&1; then
+    printf '  Docker             未安装\n'
+    return 0
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    printf '  Docker             daemon 未运行\n'
+    return 0
+  fi
+
+  container_status_line "$CPA_CONTAINER" "CLIProxyAPI"
+  if container_exists "$CPAM_CONTAINER"; then
+    container_status_line "$CPAM_CONTAINER" "CPA Manager Plus"
+  elif container_exists "$LEGACY_CPAM_CONTAINER"; then
+    container_status_line "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager"
+  else
+    container_status_line "$CPAM_CONTAINER" "CPA Manager Plus"
+  fi
+  if container_exists "$CPAM_CONTAINER" && container_exists "$LEGACY_CPAM_CONTAINER"; then
+    container_status_line "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager"
+    warn "同时检测到新旧 Manager，避免让两者消费同一个用量队列"
+  fi
+}
+
 show_all_containers() {
   docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 }
@@ -244,7 +323,7 @@ detect_install_dir() {
     return 0
   fi
 
-  for container in "$CPAM_CONTAINER" "$CPA_CONTAINER"; do
+  for container in "$CPAM_CONTAINER" "$LEGACY_CPAM_CONTAINER" "$CPA_CONTAINER"; do
     if container_exists "$container"; then
       detected="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$container" 2>/dev/null || true)"
       if [ -n "$detected" ] && [ "$detected" != "<no value>" ] && [ -d "$detected" ]; then
@@ -298,7 +377,10 @@ detect_cpam_port() {
   local port
   local secrets_value
 
-  if port="$(port_from_docker_mapping "$CPAM_CONTAINER" "$CPAM_INTERNAL_PORT")"; then
+  local manager_container
+  manager_container="$(active_cpam_container)"
+
+  if port="$(port_from_docker_mapping "$manager_container" "$CPAM_INTERNAL_PORT")"; then
     printf '%s\n' "$port"
     return 0
   fi
@@ -386,8 +468,12 @@ write_compose_yaml() {
   local install_dir="$1"
   local cpa_host_port="$2"
   local cpam_host_port="$3"
+  local cpamp_admin_key="$4"
+  local compose_file="${5:-$install_dir/docker-compose.yml}"
+  local cpamp_admin_key_yaml
+  cpamp_admin_key_yaml="$(yaml_escape_double "$cpamp_admin_key")"
 
-  cat > "$install_dir/docker-compose.yml" <<EOF
+  cat > "$compose_file" <<EOF
 services:
   cli-proxy-api:
     image: $CPA_IMAGE
@@ -405,9 +491,9 @@ services:
       - ./auths:/root/.cli-proxy-api
       - ./logs:/CLIProxyAPI/logs
 
-  cpa-manager:
+  cpa-manager-plus:
     image: $CPAM_IMAGE
-    container_name: cpa-manager
+    container_name: cpa-manager-plus
     restart: unless-stopped
     depends_on:
       - cli-proxy-api
@@ -417,6 +503,8 @@ services:
       HTTP_ADDR: "0.0.0.0:18317"
       USAGE_DATA_DIR: "/data"
       USAGE_DB_PATH: "/data/usage.sqlite"
+      CPA_MANAGER_DATA_KEY_PATH: "/data/data.key"
+      CPA_MANAGER_ADMIN_KEY: "$cpamp_admin_key_yaml"
       USAGE_COLLECTOR_MODE: "auto"
       USAGE_BATCH_SIZE: "100"
       USAGE_POLL_INTERVAL_MS: "500"
@@ -424,6 +512,11 @@ services:
       USAGE_CORS_ORIGINS: "*"
     volumes:
       - ./cpa-manager-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18317/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 EOF
 }
 
@@ -434,13 +527,16 @@ write_secrets() {
   local cpa_host_port="$4"
   local cpam_host_port="$5"
   local server_ip="$6"
+  local cpamp_admin_key="$7"
   local secrets_file="$install_dir/.secrets.txt"
 
   cat > "$secrets_file" <<EOF
 API_KEY=$api_key
 MGT_KEY=$mgt_key
+CPAMP_ADMIN_KEY=$cpamp_admin_key
 CPA_API=http://$server_ip:$cpa_host_port/v1
 CPA_MANAGER=http://$server_ip:$cpam_host_port/management.html
+CPAMP_MANAGER=http://$server_ip:$cpam_host_port/management.html
 CPA_MANAGER_SETUP_UPSTREAM=$CPA_MANAGER_SETUP_UPSTREAM
 EOF
   chmod 600 "$secrets_file"
@@ -455,7 +551,7 @@ handle_firewall() {
   command -v ufw >/dev/null 2>&1 || return 0
 
   if ufw status 2>/dev/null | grep -qw "active"; then
-    log "UFW 已启用，自动放行 CPA / CPA-Manager 相关端口"
+    log "UFW 已启用，自动放行 CPA / CPA Manager Plus 相关端口"
     for port in "${ports[@]}"; do
       ufw allow "${port}/tcp"
     done
@@ -463,7 +559,7 @@ handle_firewall() {
     return 0
   fi
 
-  if ask_yes_no "UFW 未启用，是否启用并放行 SSH、CPA、CPA-Manager 相关端口" "N"; then
+  if ask_yes_no "UFW 未启用，是否启用并放行 SSH、CPA、CPA Manager Plus 相关端口" "N"; then
     ufw allow 22/tcp
     for port in "${ports[@]}"; do
       ufw allow "${port}/tcp"
@@ -479,7 +575,7 @@ pre_install_cleanup() {
   local found=()
   local container
 
-  for container in "$CPA_CONTAINER" "$CPAM_CONTAINER" "$OLD_PANEL_CONTAINER"; do
+  for container in "$CPA_CONTAINER" "$CPAM_CONTAINER" "$LEGACY_CPAM_CONTAINER" "$OLD_PANEL_CONTAINER"; do
     if container_exists "$container"; then
       found+=("$container")
     fi
@@ -533,6 +629,8 @@ health_check() {
   local cpa_host_port="${3:-}"
   local cpam_host_port="${4:-}"
   local response
+  local cpamp_admin_key
+  local manager_container
 
   if [ -z "$cpa_host_port" ]; then
     cpa_host_port="$(detect_cpa_port "$install_dir")"
@@ -555,10 +653,84 @@ health_check() {
     warn "未找到 API_KEY，跳过 CPA API 鉴权检查"
   fi
 
-  log "CPA-Manager 健康检查: http://127.0.0.1:${cpam_host_port}/management.html"
-  if ! curl -I --max-time 8 "http://127.0.0.1:${cpam_host_port}/management.html"; then
-    warn "CPA-Manager 页面检查失败"
+  manager_container="$(active_cpam_container)"
+  if [ "$manager_container" = "$CPAM_CONTAINER" ]; then
+    log "CPA Manager Plus 健康检查: http://127.0.0.1:${cpam_host_port}/health"
+    if ! curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health"; then
+      warn "CPA Manager Plus /health 检查失败"
+    fi
+    if ! curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/usage-service/info" >/dev/null; then
+      warn "CPA Manager Plus 兼容端点检查失败"
+    fi
+    cpamp_admin_key="$(load_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" || true)"
+    if [ -n "$cpamp_admin_key" ]; then
+      if ! curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/status" -H "Authorization: Bearer ${cpamp_admin_key}" >/dev/null; then
+        warn "CPA Manager Plus /status 鉴权检查失败"
+      fi
+    else
+      warn "未找到 CPAMP_ADMIN_KEY，跳过 Plus 鉴权状态检查"
+    fi
   fi
+
+  log "Manager 页面检查: http://127.0.0.1:${cpam_host_port}/management.html"
+  if ! curl -I --max-time 8 "http://127.0.0.1:${cpam_host_port}/management.html"; then
+    warn "Manager 页面检查失败"
+  fi
+}
+
+upsert_secrets_value() {
+  local secrets_file="$1"
+  local key="$2"
+  local value="$3"
+  local temp_file="${secrets_file}.tmp.$$"
+
+  if [ -f "$secrets_file" ]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { updated=0 }
+      index($0, key "=") == 1 { print key "=" value; updated=1; next }
+      { print }
+      END { if (!updated) print key "=" value }
+    ' "$secrets_file" > "$temp_file"
+  else
+    printf '%s=%s\n' "$key" "$value" > "$temp_file"
+  fi
+  chmod 600 "$temp_file"
+  mv -f "$temp_file" "$secrets_file"
+}
+
+verify_backup_archive() {
+  local backup_file="$1"
+  [ -s "$backup_file" ] || return 1
+  tar -tzf "$backup_file" >/dev/null 2>&1
+}
+
+standard_manager_data_source() {
+  local install_dir="$1"
+  local source
+  source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$LEGACY_CPAM_CONTAINER" 2>/dev/null || true)"
+  [ -n "$source" ] || return 1
+  [ "$(readlink -f "$source" 2>/dev/null || printf '%s' "$source")" = "$(readlink -f "$install_dir/cpa-manager-data" 2>/dev/null || printf '%s' "$install_dir/cpa-manager-data")" ] || return 1
+  printf '%s\n' "$source"
+}
+
+validate_plus_migration() {
+  local install_dir="$1"
+  local cpam_host_port="$2"
+  local cpamp_admin_key="$3"
+  local attempt
+
+  for attempt in 1 2 3 4 5 6; do
+    if container_exists "$CPAM_CONTAINER" &&
+       [ "$(docker inspect -f '{{.State.Running}}' "$CPAM_CONTAINER" 2>/dev/null || true)" = "true" ] &&
+       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null &&
+       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/usage-service/info" >/dev/null &&
+       curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/status" -H "Authorization: Bearer ${cpamp_admin_key}" >/dev/null &&
+       [ -s "$install_dir/cpa-manager-data/data.key" ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
 }
 
 print_install_summary() {
@@ -568,6 +740,7 @@ print_install_summary() {
   local cpa_host_port="$4"
   local cpam_host_port="$5"
   local server_ip="$6"
+  local cpamp_admin_key="$7"
 
   cat <<EOF
 
@@ -579,7 +752,7 @@ http://$server_ip:$cpa_host_port/v1
 CPA 自带面板:
 http://$server_ip:$cpa_host_port/management.html
 
-CPA-Manager:
+CPA Manager Plus:
 http://$server_ip:$cpam_host_port/management.html
 
 API_KEY:
@@ -588,12 +761,16 @@ $api_key
 MGT_KEY:
 $mgt_key
 
+CPAMP_ADMIN_KEY:
+$cpamp_admin_key
+
 密钥已保存到：
 $install_dir/.secrets.txt
 
-首次打开 CPA-Manager 如果出现 Setup，请填：
+首次打开 CPA Manager Plus 如果出现 Setup，请填：
+管理员密钥: $cpamp_admin_key
 CPA 地址: $CPA_MANAGER_SETUP_UPSTREAM
-Management Key: $mgt_key
+CPA Management Key: $mgt_key
 EOF
 }
 
@@ -606,14 +783,26 @@ install_cpa_cpam() {
   local cpam_host_port
   local api_key
   local mgt_key
+  local cpamp_admin_key
   local server_ip
+  local install_type
+
+  install_type="$(detect_install_type)"
+  case "$install_type" in
+    legacy)
+      die "检测到旧 CPA-Manager。为保护历史数据，请先运行 migrate --dry-run 或使用菜单 12；当前版本不会通过 install 绕过迁移流程"
+      ;;
+    mixed)
+      die "同时检测到新旧 Manager。请先确认唯一用量队列消费者，禁止安装/重装"
+      ;;
+  esac
 
   install_dir="$(read_with_default "安装目录，回车使用默认 [$install_dir_default]: " "$install_dir_default")"
   cpa_host_port="$(read_with_default "CLIProxyAPI 宿主机端口，回车使用默认 [$cpa_port_default]: " "$cpa_port_default")"
-  cpam_host_port="$(read_with_default "CPA-Manager 宿主机端口，回车使用默认 [$cpam_port_default]: " "$cpam_port_default")"
+  cpam_host_port="$(read_with_default "CPA Manager Plus 宿主机端口，回车使用默认 [$cpam_port_default]: " "$cpam_port_default")"
 
   validate_port "$cpa_host_port" || die "CLIProxyAPI 宿主机端口无效: $cpa_host_port"
-  validate_port "$cpam_host_port" || die "CPA-Manager 宿主机端口无效: $cpam_host_port"
+  validate_port "$cpam_host_port" || die "CPA Manager Plus 宿主机端口无效: $cpam_host_port"
 
   if [ -n "${API_KEY:-}" ]; then
     api_key="$(read_with_default "API_KEY，回车使用环境变量提供的值: " "${API_KEY:-}")"
@@ -633,6 +822,15 @@ install_cpa_cpam() {
     mgt_key="$(generate_mgt_key)"
   fi
 
+  if [ -n "${CPAMP_ADMIN_KEY:-}" ]; then
+    cpamp_admin_key="$(read_with_default "CPAMP_ADMIN_KEY，回车使用环境变量提供的值: " "${CPAMP_ADMIN_KEY:-}")"
+  else
+    cpamp_admin_key="$(read_with_default "CPAMP_ADMIN_KEY，回车自动生成: " "")"
+  fi
+  if [ -z "$cpamp_admin_key" ]; then
+    cpamp_admin_key="$(generate_cpamp_admin_key)"
+  fi
+
   if [ -d "$install_dir" ] && { [ -f "$install_dir/config.yaml" ] || [ -f "$install_dir/docker-compose.yml" ]; }; then
     if ! ask_yes_no "检测到已有安装文件，是否继续安装/重装并覆盖配置" "Y"; then
       die "已取消安装/重装"
@@ -643,9 +841,9 @@ install_cpa_cpam() {
   prepare_install_dir "$install_dir"
   backup_existing_files "$install_dir"
   write_config_yaml "$install_dir" "$api_key" "$mgt_key"
-  write_compose_yaml "$install_dir" "$cpa_host_port" "$cpam_host_port"
+  write_compose_yaml "$install_dir" "$cpa_host_port" "$cpam_host_port" "$cpamp_admin_key"
   server_ip="$(get_server_ip)"
-  write_secrets "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip"
+  write_secrets "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip" "$cpamp_admin_key"
   handle_firewall "$cpa_host_port" "$cpam_host_port"
 
   log "拉取镜像并启动容器"
@@ -654,13 +852,20 @@ install_cpa_cpam() {
   sleep 8
   show_all_containers
   health_check "$install_dir" "$api_key" "$cpa_host_port" "$cpam_host_port"
-  print_install_summary "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip"
+  print_install_summary "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip" "$cpamp_admin_key"
 }
 
 upgrade_cpa_cpam() {
   local detected_dir
   local install_dir
   local backup_file
+  local install_type
+
+  install_type="$(detect_install_type)"
+  case "$install_type" in
+    legacy) die "检测到旧 CPA-Manager，请使用 migrate 升级到 Plus" ;;
+    mixed) die "同时检测到新旧 Manager，禁止升级，请先确认唯一消费者" ;;
+  esac
 
   detected_dir="$(detect_install_dir)"
   show_all_containers
@@ -670,7 +875,7 @@ upgrade_cpa_cpam() {
   backup_file="$install_dir/backups/pre-upgrade-$(timestamp).tar.gz"
   create_backup_archive "$install_dir" "$backup_file" docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data
 
-  log "升级 CPA + CPA-Manager"
+  log "升级 CPA + CPA Manager Plus"
   compose_in_dir "$install_dir" pull || die "docker compose pull 失败"
   compose_in_dir "$install_dir" up -d || die "docker compose up -d 失败"
   sleep 8
@@ -710,8 +915,9 @@ status_cpa_cpam() {
 
   cat <<EOF
 检测到的安装目录: $install_dir
+安装类型: $(detect_install_type)
 CPA 端口: $cpa_host_port
-CPA-Manager 端口: $cpam_host_port
+Manager 端口: $cpam_host_port
 
 容器状态:
 EOF
@@ -722,10 +928,12 @@ EOF
 
 logs_cpa_cpam() {
   local choice
+  local manager_container
+  manager_container="$(active_cpam_container)"
   cat <<'EOF'
 请选择要查看的日志：
 1) cli-proxy-api
-2) cpa-manager
+2) 当前 Manager
 3) 两个都看最近 120 行
 EOF
   if [ -t 0 ]; then
@@ -740,12 +948,12 @@ EOF
 
   case "$choice" in
     1) docker logs -f --tail=120 "$CPA_CONTAINER" ;;
-    2) docker logs -f --tail=120 "$CPAM_CONTAINER" ;;
+    2) docker logs -f --tail=120 "$manager_container" ;;
     3)
       printf '\n===== %s =====\n' "$CPA_CONTAINER"
       docker logs --tail=120 "$CPA_CONTAINER" || true
-      printf '\n===== %s =====\n' "$CPAM_CONTAINER"
-      docker logs --tail=120 "$CPAM_CONTAINER" || true
+      printf '\n===== %s =====\n' "$manager_container"
+      docker logs --tail=120 "$manager_container" || true
       ;;
     *) warn "无效选项" ;;
   esac
@@ -814,7 +1022,7 @@ uninstall_cpa_cpam() {
   detected_dir="$(detect_install_dir)"
   install_dir="$(read_with_default "安装目录，回车使用检测值 [$detected_dir]: " "$detected_dir")"
 
-  if ! ask_yes_no "确认卸载 CPA + CPA-Manager" "N"; then
+  if ! ask_yes_no "确认卸载 CPA + CPA Manager Plus" "N"; then
     log "已取消卸载"
     return 0
   fi
@@ -851,6 +1059,229 @@ docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-l
 EOF
 }
 
+preflight_cpa_cpam() {
+  local install_type
+  local install_dir
+  local manager_container
+  local data_source
+  local image
+
+  printf 'CPA Manager Plus 迁移预检（只读）\n\n'
+  if ! command -v docker >/dev/null 2>&1; then
+    printf 'Docker: 未安装\n安装类型: not-installed\n'
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    printf 'Docker: daemon 未运行\n安装类型: unknown\n'
+    return 1
+  fi
+
+  install_type="$(detect_install_type)"
+  install_dir="$(detect_install_dir)"
+  manager_container="$(active_cpam_container)"
+  printf '安装类型: %s\n安装目录: %s\n' "$install_type" "$install_dir"
+  show_menu_status
+
+  if container_exists "$manager_container"; then
+    image="$(docker inspect -f '{{.Config.Image}}' "$manager_container" 2>/dev/null || true)"
+    data_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$manager_container" 2>/dev/null || true)"
+    printf '\nManager 容器: %s\nManager 镜像: %s\n/data 来源: %s\n' "$manager_container" "${image:-未知}" "${data_source:-未检测到}"
+  fi
+
+  if [ -f "$install_dir/config.yaml" ]; then
+    if grep -Eq '^[[:space:]]*usage-statistics-enabled:[[:space:]]*true' "$install_dir/config.yaml"; then
+      printf '用量统计: 已启用\n'
+    else
+      warn "config.yaml 未确认启用 usage-statistics-enabled"
+    fi
+    if grep -Eq '^[[:space:]]*allow-remote:[[:space:]]*true' "$install_dir/config.yaml"; then
+      printf '远程管理: 已启用\n'
+    else
+      warn "config.yaml 未确认启用 remote-management.allow-remote"
+    fi
+  else
+    warn "未找到 $install_dir/config.yaml"
+  fi
+
+  case "$install_type" in
+    legacy) printf '\n结论: 可进入迁移准备；正式迁移前需停止旧 Manager 并创建一致性备份。\n' ;;
+    plus) printf '\n结论: 当前已经是 CPA Manager Plus，无需迁移。\n' ;;
+    mixed)
+      warn "结论: 同时存在新旧 Manager，已阻断迁移，请先确认唯一消费者"
+      return 1
+      ;;
+    *)
+      warn "结论: 未发现可自动迁移的旧 CPA-Manager"
+      return 1
+      ;;
+  esac
+}
+
+migrate_dry_run() {
+  local install_type
+  install_type="$(detect_install_type)"
+  preflight_cpa_cpam || return 1
+
+  if [ "$install_type" != "legacy" ]; then
+    return 0
+  fi
+
+  cat <<'EOF'
+
+迁移计划（未执行任何写操作）:
+1. 记录旧容器、镜像、端口、挂载和 Compose 状态
+2. 仅停止旧 cpa-manager，保持 cli-proxy-api 运行
+3. 备份完整 cpa-manager-data、Compose 和密钥文件并校验
+4. 保持 18317 外部端口和原 /data 挂载不变
+5. 切换为 seakee/cpa-manager-plus 并生成独立 CPAMP_ADMIN_KEY
+6. 验证 /health、/usage-service/info、鉴权 /status 和 data.key
+7. 验证失败时从迁移前快照恢复旧 Manager
+
+EOF
+}
+
+rollback_from_snapshot() {
+  local install_dir="$1"
+  local snapshot_dir="$2"
+  local backup_file="$snapshot_dir/pre-migration.tar.gz"
+  local failed_dir="$install_dir/cpa-manager-data.failed-$(timestamp)"
+
+  [ -d "$snapshot_dir" ] || die "迁移快照不存在: $snapshot_dir"
+  verify_backup_archive "$backup_file" || die "迁移快照损坏或不可读: $backup_file"
+
+  if container_exists "$CPAM_CONTAINER"; then
+    docker rm -f "$CPAM_CONTAINER" >/dev/null || warn "删除 Plus 容器失败，请手动检查"
+  fi
+  if [ -d "$install_dir/cpa-manager-data" ]; then
+    mv "$install_dir/cpa-manager-data" "$failed_dir" || die "无法保留 Plus 失败现场"
+    warn "Plus 数据现场已保留到: $failed_dir"
+  fi
+
+  rm -f "$install_dir/docker-compose.yml" "$install_dir/.secrets.txt"
+  (cd "$install_dir" && tar -xzf "$backup_file") || die "恢复迁移前文件失败"
+  chmod 600 "$install_dir/.secrets.txt" 2>/dev/null || true
+  compose_in_dir "$install_dir" up -d --remove-orphans || die "旧 CPA-Manager 恢复后启动失败"
+  log "已恢复迁移前 CPA-Manager 状态"
+}
+
+rollback_cpa_cpam() {
+  local install_dir
+  local marker_file
+  local snapshot_dir
+
+  install_dir="$(detect_install_dir)"
+  marker_file="$install_dir/.last-migration-backup"
+  [ -f "$marker_file" ] || die "未找到可用迁移快照标记: $marker_file"
+  snapshot_dir="$(head -n 1 "$marker_file")"
+
+  if ! ask_yes_no "确认使用 $snapshot_dir 回滚到旧 CPA-Manager" "N"; then
+    log "已取消回滚"
+    return 0
+  fi
+  rollback_from_snapshot "$install_dir" "$snapshot_dir"
+}
+
+migrate_cpa_cpam() {
+  local install_dir
+  local install_type
+  local cpa_host_port
+  local cpam_host_port
+  local cpamp_admin_key
+  local snapshot_dir
+  local backup_file
+  local temp_compose
+  local current_cpa_image
+
+  preflight_cpa_cpam || die "迁移预检未通过"
+  install_type="$(detect_install_type)"
+  [ "$install_type" = "legacy" ] || die "当前安装类型不是 legacy，无需或无法迁移"
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  standard_manager_data_source "$install_dir" >/dev/null || die "当前 /data 不是标准 $install_dir/cpa-manager-data bind mount；为避免数据损坏，自动迁移已阻断"
+  cpa_host_port="$(detect_cpa_port "$install_dir")"
+  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  current_cpa_image="$(docker inspect -f '{{.Config.Image}}' "$CPA_CONTAINER" 2>/dev/null || true)"
+  [ -n "$current_cpa_image" ] && CPA_IMAGE="$current_cpa_image"
+  cpamp_admin_key="${CPAMP_ADMIN_KEY:-$(generate_cpamp_admin_key)}"
+
+  if ! ask_yes_no "确认迁移到 CPA Manager Plus（CPA API 保持运行，Manager 会短暂停机）" "N"; then
+    log "已取消迁移"
+    return 0
+  fi
+
+  snapshot_dir="$install_dir/backups/migration-$(timestamp)"
+  backup_file="$snapshot_dir/pre-migration.tar.gz"
+  temp_compose="$install_dir/docker-compose.yml.cpamp.tmp"
+  mkdir -p "$snapshot_dir"
+
+  write_compose_yaml "$install_dir" "$cpa_host_port" "$cpam_host_port" "$cpamp_admin_key" "$temp_compose"
+  compose_in_dir "$install_dir" -f "$temp_compose" config >/dev/null || die "Plus Compose 校验失败，未停止旧 Manager"
+
+  log "停止旧 CPA-Manager 以创建一致性 SQLite 备份"
+  docker stop "$LEGACY_CPAM_CONTAINER" >/dev/null || die "停止旧 CPA-Manager 失败"
+  create_backup_archive "$install_dir" "$backup_file" docker-compose.yml .secrets.txt cpa-manager-data
+  if ! verify_backup_archive "$backup_file"; then
+    docker start "$LEGACY_CPAM_CONTAINER" >/dev/null || true
+    die "迁移备份校验失败，旧 Manager 已尝试恢复"
+  fi
+
+  docker inspect "$LEGACY_CPAM_CONTAINER" > "$snapshot_dir/legacy-container-inspect.json" 2>/dev/null || true
+  cat > "$snapshot_dir/manifest.env" <<EOF
+INSTALL_DIR=$install_dir
+CPA_HOST_PORT=$cpa_host_port
+CPAM_HOST_PORT=$cpam_host_port
+LEGACY_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$LEGACY_CPAM_CONTAINER" 2>/dev/null || true)
+PLUS_IMAGE=$CPAM_IMAGE
+CREATED_AT=$(timestamp)
+EOF
+  printf '%s\n' "$snapshot_dir" > "$install_dir/.last-migration-backup"
+  mv -f "$temp_compose" "$install_dir/docker-compose.yml"
+  upsert_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" "$cpamp_admin_key"
+
+  log "拉取并启动 CPA Manager Plus"
+  if ! compose_in_dir "$install_dir" pull cpa-manager-plus || ! compose_in_dir "$install_dir" up -d --no-deps cpa-manager-plus; then
+    warn "Plus 启动失败，开始自动回滚"
+    rollback_from_snapshot "$install_dir" "$snapshot_dir"
+    return 1
+  fi
+
+  if ! validate_plus_migration "$install_dir" "$cpam_host_port" "$cpamp_admin_key"; then
+    docker logs --tail=200 "$CPAM_CONTAINER" > "$snapshot_dir/plus-failed.log" 2>&1 || true
+    warn "Plus 验证失败，开始自动回滚"
+    rollback_from_snapshot "$install_dir" "$snapshot_dir"
+    return 1
+  fi
+
+  docker rm "$LEGACY_CPAM_CONTAINER" >/dev/null || warn "旧 Manager 容器删除失败，请确认其保持停止"
+  create_backup_archive "$install_dir" "$snapshot_dir/post-migration.tar.gz" docker-compose.yml .secrets.txt cpa-manager-data
+  verify_backup_archive "$snapshot_dir/post-migration.tar.gz" || warn "迁移后备份校验失败，请立即手工备份"
+  log "迁移成功。访问地址和端口保持不变: http://服务器IP:${cpam_host_port}/management.html"
+  log "如需回滚，请运行: bash cpa-cpam-manager.sh rollback"
+}
+
+migration_menu() {
+  local choice
+  cat <<'EOF'
+请选择迁移操作：
+1) 只读预检
+2) 查看迁移计划（dry-run）
+3) 正式迁移到 CPA Manager Plus
+4) 回滚最近一次迁移
+0) 返回
+EOF
+  printf "请输入选项 [1]: "
+  read -r choice || choice="1"
+  [ -n "$choice" ] || choice="1"
+  case "$choice" in
+    1) preflight_cpa_cpam ;;
+    2) migrate_dry_run ;;
+    3) migrate_cpa_cpam ;;
+    4) rollback_cpa_cpam ;;
+    0) return 0 ;;
+    *) warn "无效选项" ;;
+  esac
+}
+
 print_help() {
   cat <<'EOF'
 用法：
@@ -858,8 +1289,11 @@ print_help() {
 
 命令：
   menu       交互菜单
-  install    安装 / 重装 CPA + CPA-Manager
-  upgrade    升级 CPA + CPA-Manager
+  install    安装 / 重装 CPA + CPA Manager Plus
+  upgrade    升级 CPA + CPA Manager Plus
+  preflight  只读检查当前安装和迁移条件
+  migrate    正式迁移旧 Manager（可加 --dry-run）
+  rollback   回滚最近一次迁移
   start      启动
   stop       停止
   restart    重启
@@ -876,18 +1310,21 @@ print_help() {
   CPAM_HOST_PORT=18317
   API_KEY=sk-cpa-xxx
   MGT_KEY=mgt-cpa-xxx
+  CPAMP_ADMIN_KEY=cpamp_xxx
+  CPAM_IMAGE=seakee/cpa-manager-plus:latest
 EOF
 }
 
 menu_loop() {
   local choice
   while true; do
+    show_menu_status
     cat <<'EOF'
 
-CLIProxyAPI + CPA-Manager 运维脚本
+CLIProxyAPI + CPA Manager Plus 运维脚本
 
-1) 安装 / 重装 CPA + CPA-Manager
-2) 升级 CPA + CPA-Manager
+1) 安装 / 重装 CPA + CPA Manager Plus
+2) 升级 CPA + CPA Manager Plus
 3) 启动
 4) 停止
 5) 重启
@@ -897,6 +1334,7 @@ CLIProxyAPI + CPA-Manager 运维脚本
 9) 查看密钥 / 地址
 10) Codex OAuth 登录命令提示
 11) 卸载
+12) Plus 迁移 / 预检 / 回滚
 0) 退出
 EOF
     printf "请输入选项: "
@@ -913,6 +1351,7 @@ EOF
       9) show_keys ;;
       10) codex_login_hint ;;
       11) uninstall_cpa_cpam ;;
+      12) migration_menu ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
@@ -921,6 +1360,7 @@ EOF
 
 main() {
   local command_name="${1:-menu}"
+  local command_option="${2:-}"
 
   need_root
 
@@ -928,6 +1368,28 @@ main() {
     help|-h|--help)
       print_help
       return 0
+      ;;
+    preflight)
+      preflight_cpa_cpam
+      return $?
+      ;;
+    migrate)
+      install_basic_deps
+      ensure_docker_interactive
+      if [ "$command_option" = "--dry-run" ]; then
+        migrate_dry_run
+      elif [ -z "$command_option" ]; then
+        migrate_cpa_cpam
+      else
+        die "未知 migrate 参数: $command_option"
+      fi
+      return $?
+      ;;
+    rollback)
+      install_basic_deps
+      ensure_docker_interactive
+      rollback_cpa_cpam
+      return $?
       ;;
     menu|install|upgrade|start|stop|restart|status|logs|backup|keys|uninstall|codex-login)
       install_basic_deps
@@ -955,4 +1417,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

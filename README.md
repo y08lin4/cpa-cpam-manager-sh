@@ -1,16 +1,16 @@
-# CPA + CPA-Manager 运维脚本
+# CPA + CPA Manager Plus 运维脚本
 
-这是一个可公开发布的 Bash 运维脚本项目，用于在 Debian/Ubuntu VPS 上一键安装、升级和运维 CLIProxyAPI + CPA-Manager。
+这是一个可公开发布的 Bash 运维脚本项目，用于在 Debian/Ubuntu VPS 上一键安装、升级和运维 CLIProxyAPI + CPA Manager Plus，并识别旧 CPA-Manager 安装。
 
 部署的容器：
 
 - `cli-proxy-api`：使用镜像 `eceasy/cli-proxy-api:latest`
-- `cpa-manager`：使用镜像 `seakee/cpa-manager:latest`
+- `cpa-manager-plus`：使用镜像 `seakee/cpa-manager-plus:latest`
 
 上游原仓库：
 
 - CLIProxyAPI: https://github.com/router-for-me/CLIProxyAPI
-- CPA-Manager: https://github.com/seakee/CPA-Manager
+- CPA Manager Plus: https://github.com/seakee/CPA-Manager-Plus
 
 默认安装目录：`/opt/cliproxy-cpam`
 
@@ -18,12 +18,15 @@
 
 ## 功能列表
 
-- 一键安装 / 重装 CPA + CPA-Manager
+- 一键安装 / 重装 CPA + CPA Manager Plus
+- 菜单顶部实时显示容器、镜像/版本、运行状态和端口
+- 识别旧 CPA-Manager、Plus、混合安装和仅 CPA 安装
+- 提供只读迁移预检和 `migrate --dry-run`
 - 拉取最新镜像并升级
 - 启动、停止、重启容器
 - 查看容器状态和健康检查
 - 查看日志
-- 备份配置、认证数据、日志和 CPA-Manager 数据
+- 备份配置、认证数据、日志和 Manager 数据
 - 查看 API_KEY、MGT_KEY 和访问地址
 - 输出 Codex OAuth 登录命令提示
 - 卸载，并可选择是否保留数据
@@ -76,6 +79,7 @@ INSTALL_DIR='/opt/cliproxy-cpam' CPA_HOST_PORT='8317' CPAM_HOST_PORT='18317' bas
 
 - `API_KEY`：`sk-cpa-` + 随机 48 位 hex
 - `MGT_KEY`：`mgt-cpa-` + 随机 48 位 hex
+- `CPAMP_ADMIN_KEY`：`cpamp_` + 随机 48 位 hex
 
 密钥会保存到：
 
@@ -90,15 +94,41 @@ INSTALL_DIR='/opt/cliproxy-cpam' CPA_HOST_PORT='8317' CPAM_HOST_PORT='18317' bas
 ```text
 CPA API: http://服务器IP:8317/v1
 CPA 自带面板: http://服务器IP:8317/management.html
-CPA-Manager: http://服务器IP:18317/management.html
+CPA Manager Plus: http://服务器IP:18317/management.html
 ```
 
-CPA-Manager 首次 Setup：
+CPA Manager Plus 首次 Setup：
 
 ```text
+管理员密钥: 安装时设置的 CPAMP_ADMIN_KEY
 CPA 地址: http://cli-proxy-api:8317
-Management Key: 安装时设置的 MGT_KEY
+CPA Management Key: 安装时设置的 MGT_KEY
 ```
+
+`CPAMP_ADMIN_KEY` 用于登录 Plus；`MGT_KEY` 用于 Plus 连接 CPA Management API，两者不能混用。
+
+## 菜单状态与迁移预检
+
+交互菜单每次刷新时都会显示类似信息：
+
+```text
+当前运行状态:
+  CLIProxyAPI        running  镜像/版本: eceasy/cli-proxy-api:latest  端口: ...
+  CPA Manager Plus   running  镜像/版本: seakee/cpa-manager-plus:latest  端口: ...
+```
+
+检查旧安装是否具备迁移条件：
+
+```bash
+bash cpa-cpam-manager.sh preflight
+bash cpa-cpam-manager.sh migrate --dry-run
+bash cpa-cpam-manager.sh migrate
+bash cpa-cpam-manager.sh rollback
+```
+
+`preflight` 和 `migrate --dry-run` 不会停止容器或修改文件。正式 `migrate` 会停止旧 Manager、创建并校验一致性备份、切换到 Plus，验证失败时自动回滚；CPA API 容器保持运行。当前自动迁移仅支持本脚本生成的标准 `cpa-manager-data:/data` bind mount 部署，自定义挂载会被安全阻断。
+
+迁移成功后仍可执行 `rollback` 恢复最近一次迁移前快照。迁移前后备份位于安装目录的 `backups/migration-*`。
 
 说明：CPA 启动后可能会把 `config.yaml` 里的 `remote-management.secret-key` 自动转为 bcrypt hash；如果 `.secrets.txt` 丢失，无法从 bcrypt hash 反推出明文 Management Key。
 
@@ -135,7 +165,7 @@ bash cpa-cpam-manager.sh logs
 可选择查看：
 
 - `cli-proxy-api`
-- `cpa-manager`
+- 当前 Manager（自动识别 `cpa-manager-plus` 或旧 `cpa-manager`）
 - 两个容器最近 120 行日志
 
 ## 卸载
@@ -191,4 +221,4 @@ docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-l
 11451/tcp
 ```
 
-如果 `ufw` 未启用，脚本不会默认启用，避免锁 SSH；只有在你确认后才会放行 SSH、CPA、CPA-Manager 相关端口并启用 UFW。
+如果 `ufw` 未启用，脚本不会默认启用，避免锁 SSH；只有在你确认后才会放行 SSH、CPA、CPA Manager Plus 相关端口并启用 UFW。
