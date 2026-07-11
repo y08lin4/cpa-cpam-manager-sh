@@ -5,7 +5,7 @@ export PATH="/usr/bin:/bin:/mingw64/bin:/cmd:${PATH:-}"
 
 # 验证升级版本展示优先使用 OCI 版本，并在缺少版本时回退到 revision/镜像 ID。
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../cpa-cpam-manager.sh
+# shellcheck source=cpa-cpam-manager.sh
 NO_COLOR=1 source "$ROOT_DIR/cpa-cpam-manager.sh"
 
 docker() {

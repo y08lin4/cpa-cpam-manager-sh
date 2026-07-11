@@ -955,7 +955,9 @@ validate_plus_migration() {
        [ -s "$install_dir/cpa-manager-data/data.key" ]; then
       return 0
     fi
-    sleep 5
+    if [ "$attempt" -lt 6 ]; then
+      sleep 5
+    fi
   done
   return 1
 }
@@ -1138,8 +1140,12 @@ upgrade_cpa_cpam() {
   manager_target_ref="$(docker inspect -f '{{.Config.Image}}' "$CPAM_CONTAINER" 2>/dev/null || true)"
   cpa_current_id="$(container_image_id "$CPA_CONTAINER")"
   manager_current_id="$(container_image_id "$CPAM_CONTAINER")"
-  [ -n "$cpa_target_ref" ] && [ -n "$manager_target_ref" ] || die "无法读取当前容器镜像配置"
-  [ -n "$cpa_current_id" ] && [ -n "$manager_current_id" ] || die "无法读取当前容器镜像 ID"
+  if [ -z "$cpa_target_ref" ] || [ -z "$manager_target_ref" ]; then
+    die "无法读取当前容器镜像配置"
+  fi
+  if [ -z "$cpa_current_id" ] || [ -z "$manager_current_id" ]; then
+    die "无法读取当前容器镜像 ID"
+  fi
 
   printf '\n正在检查镜像仓库，请稍候...\n'
   pull_image_quietly "$cpa_target_ref" || die "CLIProxyAPI 最新镜像检查失败"
@@ -1147,7 +1153,9 @@ upgrade_cpa_cpam() {
 
   cpa_target_id="$(image_ref_id "$cpa_target_ref")"
   manager_target_id="$(image_ref_id "$manager_target_ref")"
-  [ -n "$cpa_target_id" ] && [ -n "$manager_target_id" ] || die "最新镜像下载完成，但无法读取镜像 ID"
+  if [ -z "$cpa_target_id" ] || [ -z "$manager_target_id" ]; then
+    die "最新镜像下载完成，但无法读取镜像 ID"
+  fi
 
   [ "$cpa_current_id" != "$cpa_target_id" ] && cpa_changed="true"
   [ "$manager_current_id" != "$manager_target_id" ] && manager_changed="true"
@@ -1622,7 +1630,8 @@ rollback_from_snapshot() {
   local install_dir="$1"
   local snapshot_dir="$2"
   local backup_file="$snapshot_dir/pre-migration.tar.gz"
-  local failed_dir="$install_dir/cpa-manager-data.failed-$(timestamp)"
+  local failed_dir
+  failed_dir="$install_dir/cpa-manager-data.failed-$(timestamp)"
 
   [ -d "$snapshot_dir" ] || die "迁移快照不存在: $snapshot_dir"
   verify_backup_archive "$backup_file" || die "迁移快照损坏或不可读: $backup_file"

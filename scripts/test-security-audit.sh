@@ -5,7 +5,7 @@ export PATH="/usr/bin:/bin:/mingw64/bin:/cmd:${PATH:-}"
 
 # 验证访问来源提取会统计公开地址，并排除内网、回环和保留地址。
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../cpa-cpam-manager.sh
+# shellcheck source=cpa-cpam-manager.sh
 NO_COLOR=1 source "$ROOT_DIR/cpa-cpam-manager.sh"
 
 if [ -n "${PYTHON_BIN:-}" ] && "$PYTHON_BIN" -c 'import ipaddress' >/dev/null 2>&1; then
