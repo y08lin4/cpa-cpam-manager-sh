@@ -167,6 +167,7 @@ bash cpa-cpam-manager.sh install
 | `CPAM_IMAGE` | `seakee/cpa-manager-plus:latest` | Plus 镜像，可指定版本 tag |
 | `CPA_IMAGE` | `eceasy/cli-proxy-api:latest` | CLIProxyAPI 镜像，可指定版本 tag |
 | `ASSUME_YES` | `0` | 设为 `1` 时自动确认高风险操作，仅用于可信自动化环境 |
+| `IP_API_BATCH_URL` | `http://ip-api.com/batch` | 访客公网 IP 批量归属查询接口；可替换为兼容的 HTTPS 端点 |
 
 自动生成的密钥格式：
 
@@ -283,7 +284,9 @@ bash cpa-cpam-manager.sh upgrade
 bash cpa-cpam-manager.sh security
 ```
 
-安全巡检会从最近 24 小时的 CLIProxyAPI 容器日志和文件日志中提取公开来源 IPv4/IPv6，按出现次数列出前 30 个，并统计常见 401、403、unauthorized、forbidden 等鉴权失败线索。
+安全巡检会从最近 24 小时的 CLIProxyAPI 容器日志和文件日志中提取来源 IPv4/IPv6，并分成“成功调用 IP 排名”和“失败调用 IP 排名”两部分，各显示前 30 个来源。HTTP 2xx 计为成功，HTTP 4xx/5xx 或明确失败关键词计为失败；没有明确调用结果的日志不会混入排名。公网、内网和回环地址都会统计，内网与本地地址会在归属列中单独标记。脚本还会统计常见 401、403、unauthorized、forbidden 等鉴权失败线索。
+
+经用户确认后，脚本会把两张榜单前 30 名中去重后的公网 IP 通过 [IP-API Batch](https://ip-api.com/docs/api:batch) 批量查询国家、地区、城市、ASN、运营商、代理和机房标记。单批最多发送 100 个公网 IP；内网和回环地址不会发送。免费 Batch 端点使用 HTTP，脚本会在调用前明确提示这一隐私与传输风险；接口失败或限流不会影响本地排行榜。
 
 随后脚本会单独询问是否调用 [IPPure](https://my.ippure.com/v1/info)。该接口返回服务器出口 IP 的位置、ASN 等信息，不用于查询每一个访问者 IP。接口若返回风险系数、原生 IP、机房 IP 字段则展示；未返回时明确标记“接口未返回”。
 

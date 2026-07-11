@@ -13,6 +13,7 @@ LEGACY_CPAM_CONTAINER="cpa-manager"
 CPA_INTERNAL_PORT="8317"
 CPAM_INTERNAL_PORT="18317"
 CPA_MANAGER_SETUP_UPSTREAM="http://cli-proxy-api:8317"
+IP_API_BATCH_URL="${IP_API_BATCH_URL:-http://ip-api.com/batch}"
 
 # 终端配色。设置 NO_COLOR=1 时关闭颜色，兼容不支持 ANSI 的终端和日志采集场景。
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -1402,7 +1403,8 @@ docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-l
 EOF
 }
 
-# 从最近 24 小时的容器日志和文件日志中提取全局可路由 IP，并按出现次数排序。
+# 从最近 24 小时的容器日志和文件日志中提取有效 IP，包括公网、内网和回环地址。
+# 仅将带有明确结果的请求计入榜单：HTTP 2xx 视为成功，HTTP 4xx/5xx 或明确失败关键词视为失败。
 collect_recent_access_ips() {
   local install_dir="$1"
   local log_sample="$2"
@@ -1431,24 +1433,175 @@ import re
 import sys
 
 path = sys.argv[1]
-text = open(path, "r", encoding="utf-8", errors="ignore").read()
-patterns = [
+lines = open(path, "r", encoding="utf-8", errors="ignore")
+ip_patterns = [
     r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])",
     r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])",
 ]
-counts = collections.Counter()
-for pattern in patterns:
-    for candidate in re.findall(pattern, text):
+status_patterns = [
+    re.compile(r'\b(?:status(?:_code)?|http_status|code)\s*[:=]\s*["\']?([1-5][0-9]{2})\b', re.I),
+    re.compile(r'"\s+([1-5][0-9]{2})\s+(?:[0-9]+|-)'),
+    re.compile(r'\|\s*([1-5][0-9]{2})\s*\|'),
+]
+failure_pattern = re.compile(
+    r'\b(?:unauthorized|forbidden|authentication failed|invalid\s+(?:api[-_ ]?)?(?:key|token)|'
+    r'request failed|upstream failed|timeout|timed out|connection refused)\b',
+    re.I,
+)
+counts = {
+    "success": collections.Counter(),
+    "failure": collections.Counter(),
+}
+
+for line in lines:
+    addresses = set()
+    for pattern in ip_patterns:
+      for candidate in re.findall(pattern, line):
         try:
             address = ipaddress.ip_address(candidate)
         except ValueError:
             continue
-        if address.is_global:
-            counts[str(address)] += 1
+        # 组播和未指定地址不是有效调用来源；内网、链路本地和回环地址仍需统计。
+        if not address.is_multicast and not address.is_unspecified:
+            addresses.add(str(address))
 
-for address, count in counts.most_common(30):
-    print(f"{count}\t{address}")
+    if not addresses:
+        continue
+
+    status = None
+    for pattern in status_patterns:
+        match = pattern.search(line)
+        if match:
+            status = int(match.group(1))
+            break
+
+    category = None
+    if status is not None:
+        if 200 <= status < 300:
+            category = "success"
+        elif 400 <= status < 600:
+            category = "failure"
+    elif failure_pattern.search(line):
+        category = "failure"
+
+    if category:
+        for address in addresses:
+            counts[category][address] += 1
+
+for category in ("success", "failure"):
+    for address, count in counts[category].most_common():
+        scope = "public" if ipaddress.ip_address(address).is_global else "internal"
+        print(f"{category}\t{count}\t{address}\t{scope}")
 PY
+}
+
+# 使用统一列宽输出 IP 排名；每张榜单最多展示 30 个来源，避免终端被长日志淹没。
+print_access_ip_ranking() {
+  local title="$1"
+  local report_file="$2"
+  local empty_message="$3"
+  local geo_report="$4"
+
+  print_section "$title"
+  if [ -s "$report_file" ]; then
+    printf '%-8s %-39s %s\n' '次数' 'IP 地址' '归属信息'
+    printf '%s\n' '────────────────────────────────────────────────────────────────────────────────────────'
+    head -n 30 "$report_file" | awk -F '\t' -v geo_file="$geo_report" '
+      BEGIN {
+        while ((getline line < geo_file) > 0) {
+          split(line, fields, "\t")
+          geo[fields[1]] = fields[2]
+        }
+        close(geo_file)
+      }
+      {
+        if ($3 == "internal") {
+          location = "内网/本地地址"
+        } else if ($2 in geo) {
+          location = geo[$2]
+        } else {
+          location = "公网 IP（未查询归属）"
+        }
+        printf "%-8s %-39s %s\n", $1, $2, location
+      }'
+  else
+    printf '%b  %s\n' "$ICON_OK" "$empty_message"
+  fi
+}
+
+# 仅把两张榜单前 30 名中的公网 IP 发给 IP-API；内网和回环地址只在本地标记。
+query_ranked_ip_geolocation() {
+  local success_report="$1"
+  local failure_report="$2"
+  local geo_report="$3"
+  local work_dir="$4"
+  local public_ips="$work_dir/public-ips.txt"
+  local request_file="$work_dir/ip-api-request.json"
+  local response_file="$work_dir/ip-api-response.json"
+  local request_url
+
+  : > "$geo_report"
+  {
+    head -n 30 "$success_report"
+    head -n 30 "$failure_report"
+  } | awk -F '\t' '$3 == "public" { print $2 }' | sort -u | head -n 100 > "$public_ips"
+
+  if [ ! -s "$public_ips" ]; then
+    log "排行榜中没有需要查询归属的公网 IP"
+    return 0
+  fi
+
+  print_section "公网 IP 归属查询（IP-API Batch）"
+  printf '待查询公网 IP：%s 个；内网和本地地址不会发送。\n' "$(wc -l < "$public_ips" | tr -d ' ')"
+  printf '隐私提示：免费 Batch 接口使用 HTTP，请求中的公网 IP 会发送给 ip-api.com。\n'
+  if ! ask_yes_no "确认调用 $IP_API_BATCH_URL 批量查询排行榜公网 IP" "N"; then
+    log "已跳过公网 IP 归属查询，排行榜仍会正常显示"
+    return 0
+  fi
+
+  jq -R -s '
+    split("\n")
+    | map(select(length > 0) | {
+        query: .,
+        fields: "status,message,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,query"
+      })' "$public_ips" > "$request_file"
+
+  if [[ "$IP_API_BATCH_URL" == *\?* ]]; then
+    request_url="${IP_API_BATCH_URL}&lang=zh-CN"
+  else
+    request_url="${IP_API_BATCH_URL}?lang=zh-CN"
+  fi
+
+  if ! curl -fsS --max-time 25 \
+    -H 'Content-Type: application/json' \
+    -X POST \
+    --data-binary "@$request_file" \
+    "$request_url" > "$response_file"; then
+    warn "IP-API Batch 请求失败，继续显示不含归属信息的排行榜"
+    return 1
+  fi
+  if ! jq -e 'type == "array"' "$response_file" >/dev/null 2>&1; then
+    warn "IP-API Batch 返回格式异常，继续显示不含归属信息的排行榜"
+    return 1
+  fi
+
+  jq -r '
+    .[]
+    | if .status == "success" then
+        [
+          .query,
+          (([.country, .regionName, .city] | map(select(. != null and . != "")) | join(" / "))
+           + (if (.as // "") != "" then " | " + .as else "" end)
+           + (if (.isp // "") != "" then " | " + .isp else "" end)
+           + (if .proxy == true then " | 代理" else "" end)
+           + (if .hosting == true then " | 机房" else "" end))
+        ]
+      else
+        [.query, ("查询失败：" + (.message // "未知错误"))]
+      end
+    | @tsv' "$response_file" > "$geo_report"
+
+  log "IP-API Batch 归属查询完成"
 }
 
 show_ippure_info() {
@@ -1493,13 +1646,19 @@ security_audit() {
   local temp_dir
   local log_sample
   local ip_report
+  local success_report
+  local failure_report
   local auth_failures
   local total_sources
+  local success_calls
+  local failure_calls
 
   install_dir="$(detect_install_dir)"
   temp_dir="$(mktemp -d)"
   log_sample="$temp_dir/log-sample.txt"
   ip_report="$temp_dir/ip-report.tsv"
+  success_report="$temp_dir/success-report.tsv"
+  failure_report="$temp_dir/failure-report.tsv"
 
   print_section "24 小时访问来源巡检"
   printf '说明：结果来自现有日志，是辅助安全线索，不等同于入侵结论。\n'
@@ -1510,22 +1669,24 @@ security_audit() {
     rm -rf "$temp_dir"
     die "无法解析最近 24 小时访问 IP"
   fi
+  awk -F '\t' '$1 == "success" { print $2 "\t" $3 "\t" $4 }' "$ip_report" > "$success_report"
+  awk -F '\t' '$1 == "failure" { print $2 "\t" $3 "\t" $4 }' "$ip_report" > "$failure_report"
   auth_failures="$(grep -Eic '(^|[^0-9])(401|403)([^0-9]|$)|unauthorized|forbidden|invalid.*(key|token)|authentication failed' "$log_sample" 2>/dev/null || true)"
-  total_sources="$(wc -l < "$ip_report" | tr -d ' ')"
+  total_sources="$(cut -f 3 "$ip_report" | sort -u | grep -c . || true)"
+  success_calls="$(awk -F '\t' '{ total += $1 } END { print total + 0 }' "$success_report")"
+  failure_calls="$(awk -F '\t' '{ total += $1 } END { print total + 0 }' "$failure_report")"
 
-  printf '\n公开来源 IP：%s 个\n' "$total_sources"
+  printf '\n已识别调用来源 IP：%s 个\n' "$total_sources"
+  printf '成功调用：%s 次    失败调用：%s 次\n' "$success_calls" "$failure_calls"
   if [ "$auth_failures" -gt 0 ]; then
     printf '疑似鉴权失败日志：%b  %s 条，请结合日志复核\n' "$ICON_WARN" "$auth_failures"
   else
     printf '疑似鉴权失败日志：%b  未发现\n' "$ICON_OK"
   fi
-  if [ -s "$ip_report" ]; then
-    printf '\n%-10s %s\n' '出现次数' 'IP 地址'
-    printf '%s\n' '────────────────────────────────────────────────────────'
-    awk -F '\t' '{ printf "%-10s %s\n", $1, $2 }' "$ip_report"
-  else
-    printf '%b  日志中未提取到公开来源 IP；可能是日志格式未记录客户端地址。\n' "$ICON_WARN"
-  fi
+  query_ranked_ip_geolocation "$success_report" "$failure_report" "$temp_dir/geo-report.tsv" "$temp_dir" || true
+  print_access_ip_ranking "成功调用 IP 排名（前 30）" "$success_report" "最近 24 小时未识别到成功调用" "$temp_dir/geo-report.tsv"
+  print_access_ip_ranking "失败调用 IP 排名（前 30）" "$failure_report" "最近 24 小时未识别到失败调用" "$temp_dir/geo-report.tsv"
+  printf '\n说明：仅统计日志中带明确 HTTP 结果的来源 IP；2xx 计为成功，4xx/5xx 或明确失败关键词计为失败。\n'
 
   rm -rf "$temp_dir"
   show_ippure_info || warn "IPPure 查询未完成，本地 24 小时巡检结果仍然有效"
