@@ -93,10 +93,25 @@ PY
   verify_backup_archive "$ONLINE_BACKUP_FILE"
   tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './BACKUP-MANIFEST.txt'
   tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './cpa-manager-data/usage.sqlite'
-  tar -xOf "$ONLINE_BACKUP_FILE" ./BACKUP-MANIFEST.txt | grep -Fq '快速不停机备份'
-  printf '不停机备份模拟检查通过。\n'
+  tar -xOf "$ONLINE_BACKUP_FILE" ./BACKUP-MANIFEST.txt | grep -Fq '快速不停机快照'
+
+  create_snapshot_record "$TEMP_DIR/install" manual manual "自动测试备注" online
+  [ -f "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" ]
+  [ -f "$CREATED_SNAPSHOT_DIR/metadata.env" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" remark)" = "自动测试备注" ]
+  SNAPSHOT_CHECKSUM="$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" checksum_sha256)"
+  verify_restorable_snapshot "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" "$SNAPSHOT_CHECKSUM"
+  cp "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" "$TEMP_DIR/corrupted-snapshot.tar.gz"
+  printf 'corrupted' >> "$TEMP_DIR/corrupted-snapshot.tar.gz"
+  if verify_restorable_snapshot "$TEMP_DIR/corrupted-snapshot.tar.gz" "$SNAPSHOT_CHECKSUM"; then
+    printf '被修改的快照不应通过 SHA-256 校验。\n' >&2
+    exit 1
+  fi
+  collect_and_print_snapshots "$TEMP_DIR/install" >/dev/null
+  [ "${#SNAPSHOT_DIRS[@]}" -eq 1 ]
+  printf '不停机快照与目录元数据模拟检查通过。\n'
 else
-  printf '本机没有可用 Python，跳过不停机 SQLite 备份模拟。\n'
+  printf '本机没有可用 Python，跳过不停机 SQLite 快照模拟。\n'
 fi
 
 # 模拟归档失败，确认两个容器仍按正确顺序恢复。

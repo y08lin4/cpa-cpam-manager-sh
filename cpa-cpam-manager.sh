@@ -770,11 +770,22 @@ pre_install_cleanup() {
 
 prepare_install_dir() {
   local install_dir="$1"
-  mkdir -p "$install_dir/auths" "$install_dir/logs" "$install_dir/cpa-manager-data" "$install_dir/backups"
+  mkdir -p \
+    "$install_dir/auths" \
+    "$install_dir/logs" \
+    "$install_dir/cpa-manager-data" \
+    "$install_dir/snapshots/manual" \
+    "$install_dir/snapshots/system" \
+    "$install_dir/snapshots/migration"
+  chmod 700 \
+    "$install_dir/snapshots" \
+    "$install_dir/snapshots/manual" \
+    "$install_dir/snapshots/system" \
+    "$install_dir/snapshots/migration"
 }
 
 # -----------------------------------------------------------------------------
-# 备份、健康检查与迁移校验
+# 快照、健康检查与迁移校验
 # -----------------------------------------------------------------------------
 
 create_backup_archive() {
@@ -800,10 +811,10 @@ create_backup_archive() {
     rm -f "$backup_file"
     return 1
   fi
-  log "备份完成: $backup_file"
+  log "归档创建完成: $backup_file"
 }
 
-# 在不中断服务的情况下备份配置、凭证，并使用 SQLite 在线备份 API 生成一致的统计数据库快照。
+# 在不中断服务的情况下保存配置、凭证，并使用 SQLite 在线备份 API 生成一致的数据快照。
 create_online_backup_archive() {
   local install_dir="$1"
   local backup_file="$2"
@@ -813,8 +824,9 @@ create_online_backup_archive() {
   local source_db="$install_dir/cpa-manager-data/usage.sqlite"
   local target_db
 
-  mkdir -p "$install_dir/backups"
-  staging_dir="$(mktemp -d "$install_dir/backups/.online-backup.XXXXXX")"
+  mkdir -p "$(dirname "$backup_file")" "$install_dir/snapshots"
+  chmod 700 "$install_dir/snapshots"
+  staging_dir="$(mktemp -d "$install_dir/snapshots/.creating-online.XXXXXX")"
   mkdir -p "$staging_dir/cpa-manager-data"
 
   for item in docker-compose.yml config.yaml .secrets.txt auths; do
@@ -860,16 +872,16 @@ PY
       return 1
     fi
   else
-    warn "未找到 Manager SQLite，快速备份将只包含配置和凭证"
+    warn "未找到 Manager SQLite，快速快照将只包含配置和凭证"
   fi
 
   cat > "$staging_dir/BACKUP-MANIFEST.txt" <<EOF
-备份模式：快速不停机备份
+快照模式：快速不停机快照
 创建时间：$(date -Iseconds)
 强一致内容：Manager SQLite 在线快照
 尽力快照内容：Compose、配置、密钥和认证文件
 未包含内容：运行日志
-说明：服务在备份期间保持运行，后续新增数据由下一次备份继续覆盖。
+说明：服务在创建快照期间保持运行，后续新增数据由下一次快照继续覆盖。
 EOF
 
   if ! tar -C "$staging_dir" -czf "$backup_file" .; then
@@ -882,7 +894,7 @@ EOF
     rm -f "$backup_file"
     return 1
   }
-  log "快速不停机备份完成: $backup_file"
+  log "快速不停机快照完成: $backup_file"
 }
 
 # Manager 运行时会持续写入 SQLite。备份前短暂停止 Manager，并在任何结果下恢复原运行状态。
@@ -934,6 +946,363 @@ create_consistent_backup_archive() {
   done
 
   [ "$backup_ok" = "true" ] && [ "$restart_ok" = "true" ]
+}
+
+# 快照目录按用途隔离：manual 为用户创建，system 为脚本自动保护点，migration 为迁移专用。
+snapshot_root_dir() {
+  local install_dir="$1"
+  printf '%s/snapshots\n' "$install_dir"
+}
+
+sanitize_snapshot_remark() {
+  local remark="$1"
+  printf '%s' "$remark" | tr '\r\n\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+}
+
+snapshot_metadata_value() {
+  local metadata_file="$1"
+  local key="$2"
+  awk -F= -v key="$key" 'index($0, key "=") == 1 { sub(/^[^=]*=/, ""); print; exit }' "$metadata_file" 2>/dev/null
+}
+
+human_file_size() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || printf '%s B' "$bytes"
+  else
+    awk -v bytes="$bytes" 'BEGIN {
+      split("B KiB MiB GiB TiB", unit, " "); i=1;
+      while (bytes >= 1024 && i < 5) { bytes /= 1024; i++ }
+      if (i == 1) printf "%d %s", bytes, unit[i]; else printf "%.1f %s", bytes, unit[i]
+    }'
+  fi
+}
+
+CREATED_SNAPSHOT_DIR=""
+
+# 创建带独立目录和元数据的标准快照，供人工、安装、升级和恢复保护共同复用。
+create_snapshot_record() {
+  local install_dir="$1"
+  local category="$2"
+  local label="$3"
+  local remark="$4"
+  local mode="$5"
+  local root
+  local snapshot_id
+  local final_dir
+  local temp_dir
+  local archive_file
+  local size_bytes
+  local checksum_sha256
+  local suffix=0
+
+  case "$category" in
+    manual|system) ;;
+    *) warn "未知快照分类: $category"; return 1 ;;
+  esac
+  case "$mode" in
+    online|consistent) ;;
+    *) warn "未知快照模式: $mode"; return 1 ;;
+  esac
+
+  root="$(snapshot_root_dir "$install_dir")"
+  mkdir -p "$root/$category"
+  chmod 700 "$root" "$root/$category"
+  snapshot_id="${label}-$(timestamp)"
+  final_dir="$root/$category/$snapshot_id"
+  while [ -e "$final_dir" ]; do
+    suffix=$((suffix + 1))
+    final_dir="$root/$category/${snapshot_id}-${suffix}"
+  done
+  temp_dir="$root/$category/.creating-$(basename "$final_dir").$$"
+  mkdir -p "$temp_dir"
+  archive_file="$temp_dir/snapshot.tar.gz"
+
+  if [ "$mode" = "online" ]; then
+    if ! create_online_backup_archive "$install_dir" "$archive_file"; then
+      rm -rf "$temp_dir"
+      return 1
+    fi
+  else
+    if ! create_consistent_backup_archive "$install_dir" "$archive_file" all \
+      docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data; then
+      rm -rf "$temp_dir"
+      return 1
+    fi
+  fi
+
+  size_bytes="$(wc -c < "$archive_file" | tr -d ' ')"
+  checksum_sha256="$(sha256sum "$archive_file" | awk '{print $1}')"
+  remark="$(sanitize_snapshot_remark "$remark")"
+  cat > "$temp_dir/metadata.env" <<EOF
+format_version=1
+snapshot_id=$(basename "$final_dir")
+category=$category
+mode=$mode
+created_at=$(date -Iseconds)
+size_bytes=$size_bytes
+checksum_sha256=$checksum_sha256
+remark=$remark
+cpa_image=$CPA_IMAGE
+manager_image=$CPAM_IMAGE
+archive=snapshot.tar.gz
+EOF
+  chmod 600 "$temp_dir/metadata.env" "$archive_file"
+  mv "$temp_dir" "$final_dir"
+  CREATED_SNAPSHOT_DIR="$final_dir"
+  log "快照已保存: $final_dir"
+}
+
+SNAPSHOT_DIRS=()
+
+# 收集并格式化快照列表；按元数据修改时间倒序展示，避免信息堆叠。
+collect_and_print_snapshots() {
+  local install_dir="$1"
+  local root
+  local metadata_file
+  local snapshot_dir
+  local category
+  local category_label
+  local mode
+  local mode_label
+  local created_at
+  local display_time
+  local size_bytes
+  local display_size
+  local remark
+  local archive_name
+  local status_icon
+  local index=0
+
+  root="$(snapshot_root_dir "$install_dir")"
+  SNAPSHOT_DIRS=()
+  print_section "现有快照"
+  printf '%-4s %-8s %-19s %-10s %-10s %-32s %s\n' '编号' '类型' '创建时间' '模式' '大小' '备注' '状态'
+  printf '%s\n' '────────────────────────────────────────────────────────────────────────────────────'
+
+  while IFS= read -r metadata_file; do
+    [ -f "$metadata_file" ] || continue
+    snapshot_dir="$(dirname "$metadata_file")"
+    category="$(snapshot_metadata_value "$metadata_file" category)"
+    mode="$(snapshot_metadata_value "$metadata_file" mode)"
+    created_at="$(snapshot_metadata_value "$metadata_file" created_at)"
+    size_bytes="$(snapshot_metadata_value "$metadata_file" size_bytes)"
+    remark="$(snapshot_metadata_value "$metadata_file" remark)"
+    archive_name="$(snapshot_metadata_value "$metadata_file" archive)"
+    [ -n "$archive_name" ] || archive_name="snapshot.tar.gz"
+    [ -n "$size_bytes" ] || size_bytes="$(wc -c < "$snapshot_dir/$archive_name" 2>/dev/null | tr -d ' ' || printf '0')"
+    if [ -s "$snapshot_dir/$archive_name" ]; then
+      status_icon="$ICON_OK"
+    else
+      status_icon="$ICON_ERROR"
+    fi
+
+    case "$category" in
+      manual) category_label="人工" ;;
+      system) category_label="系统" ;;
+      *) category_label="未知" ;;
+    esac
+    case "$mode" in
+      online) mode_label="不停机" ;;
+      consistent) mode_label="一致性" ;;
+      *) mode_label="未知" ;;
+    esac
+    display_time="${created_at%%+*}"
+    display_time="${display_time/T/ }"
+    display_time="${display_time:0:19}"
+    display_size="$(human_file_size "$size_bytes")"
+    [ -n "$remark" ] || remark="（无备注）"
+    if [ "${#remark}" -gt 32 ]; then
+      remark="${remark:0:29}..."
+    fi
+
+    index=$((index + 1))
+    SNAPSHOT_DIRS+=("$snapshot_dir")
+    printf '%-4s %-8s %-19s %-10s %-10s %-32s %b\n' "$index" "$category_label" "$display_time" "$mode_label" "$display_size" "$remark" "$status_icon"
+  done < <(find "$root/manual" "$root/system" -mindepth 2 -maxdepth 2 -type f -name metadata.env \
+    -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+
+  if [ "$index" -eq 0 ]; then
+    printf '%b  暂无可用快照。%b\n' "$ICON_WARN" "$COLOR_RESET"
+  else
+    printf '%s\n' '────────────────────────────────────────────────────────────────────────────────────'
+    printf '共 %s 个快照；文件目录：%s\n' "$index" "$root"
+  fi
+}
+
+list_snapshots() {
+  local install_dir
+  install_dir="$(detect_install_dir)"
+  collect_and_print_snapshots "$install_dir"
+}
+
+create_snapshot() {
+  local install_dir
+  local mode_choice
+  local mode
+  local remark
+
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  remark="$(read_with_default "快照备注（可直接回车跳过）: " "")"
+  print_section "选择快照模式"
+  printf '1) 快速不停机（默认）  配置、凭证和 SQLite 时间点快照，不包含日志\n'
+  printf '2) 完整一致性          短暂停止两个服务，适合重大变更前保护\n'
+  mode_choice="$(read_with_default "请选择 [1]: " "1")"
+  case "$mode_choice" in
+    1) mode="online" ;;
+    2) mode="consistent" ;;
+    *) warn "无效快照模式: $mode_choice"; return 1 ;;
+  esac
+
+  print_section "创建快照确认"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '保存目录：%s/manual/\n' "$(snapshot_root_dir "$install_dir")"
+  printf '快照模式：%s\n' "$([ "$mode" = "online" ] && printf '快速不停机' || printf '完整一致性')"
+  printf '备注：%s\n' "${remark:-（无备注）}"
+  if ! ask_yes_no "确认创建快照" "Y"; then
+    log "已取消创建快照"
+    return 0
+  fi
+  create_snapshot_record "$install_dir" manual manual "$remark" "$mode" || die "创建快照失败"
+  collect_and_print_snapshots "$install_dir"
+}
+
+# 仅允许脚本自身生成的受管文件进入恢复区，拒绝路径穿越和未知顶层文件。
+verify_restorable_snapshot() {
+  local archive_file="$1"
+  local expected_checksum="${2:-}"
+  local actual_checksum
+  local entry
+  verify_backup_archive "$archive_file" || return 1
+  if [ -n "$expected_checksum" ]; then
+    actual_checksum="$(sha256sum "$archive_file" | awk '{print $1}')"
+    [ "$actual_checksum" = "$expected_checksum" ] || return 1
+  fi
+  while IFS= read -r entry; do
+    entry="${entry#./}"
+    [ -z "$entry" ] && continue
+    case "/$entry/" in
+      *'/../'*) return 1 ;;
+    esac
+    case "$entry" in
+      docker-compose.yml|config.yaml|.secrets.txt|BACKUP-MANIFEST.txt|auths|auths/*|cpa-manager-data|cpa-manager-data/*) ;;
+      *) warn "快照包含未知路径，已拒绝恢复: $entry"; return 1 ;;
+    esac
+  done < <(tar -tzf "$archive_file")
+}
+
+# 恢复后同时验证两个服务，避免“容器已启动”被误判为“数据可用”。
+validate_snapshot_restore() {
+  local install_dir="$1"
+  local cpa_host_port
+  local cpam_host_port
+  local api_key
+  local attempt
+
+  cpa_host_port="$(detect_cpa_port "$install_dir")"
+  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  api_key="$(load_secrets_value "$install_dir/.secrets.txt" "API_KEY" || true)"
+  for attempt in 1 2 3 4 5 6; do
+    if curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null 2>&1 &&
+       { [ -z "$api_key" ] || curl -fsS --max-time 8 "http://127.0.0.1:${cpa_host_port}/v1/models" \
+           -H "Authorization: Bearer ${api_key}" >/dev/null 2>&1; }; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+restore_snapshot() {
+  local install_dir
+  local selection
+  local snapshot_dir
+  local metadata_file
+  local archive_file
+  local snapshot_id
+  local created_at
+  local remark
+  local checksum_sha256
+  local staging_dir
+  local rollback_dir
+  local item
+  local restore_ok="true"
+
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  collect_and_print_snapshots "$install_dir"
+  [ "${#SNAPSHOT_DIRS[@]}" -gt 0 ] || return 0
+  selection="$(read_with_default "请输入要恢复的快照编号，回车取消: " "")"
+  [ -n "$selection" ] || { log "已取消恢复"; return 0; }
+  [[ "$selection" =~ ^[0-9]+$ ]] || die "快照编号必须是数字"
+  (( selection >= 1 && selection <= ${#SNAPSHOT_DIRS[@]} )) || die "快照编号超出范围"
+
+  snapshot_dir="${SNAPSHOT_DIRS[$((selection - 1))]}"
+  metadata_file="$snapshot_dir/metadata.env"
+  archive_file="$snapshot_dir/$(snapshot_metadata_value "$metadata_file" archive)"
+  snapshot_id="$(snapshot_metadata_value "$metadata_file" snapshot_id)"
+  created_at="$(snapshot_metadata_value "$metadata_file" created_at)"
+  remark="$(snapshot_metadata_value "$metadata_file" remark)"
+  checksum_sha256="$(snapshot_metadata_value "$metadata_file" checksum_sha256)"
+  verify_restorable_snapshot "$archive_file" "$checksum_sha256" || die "快照校验失败、不可读或包含不安全路径: $snapshot_dir"
+
+  print_section "恢复快照确认"
+  printf '目标快照：%s\n' "$snapshot_id"
+  printf '创建时间：%s\n' "$created_at"
+  printf '备注：%s\n' "${remark:-（无备注）}"
+  printf '影响：CPA 与 Manager 将短暂停止；配置、凭证和 Manager 数据会回到该快照。\n'
+  printf '保护措施：恢复前会自动创建一份当前状态保护快照；原始日志不会删除。\n'
+  if ! ask_yes_no "已核对目标，确认恢复快照" "N"; then
+    log "已取消恢复"
+    return 0
+  fi
+
+  create_snapshot_record "$install_dir" system pre-restore "恢复 $snapshot_id 前自动保护" consistent || die "恢复前保护快照创建失败，已中止"
+  staging_dir="$(mktemp -d "$install_dir/.restoring-snapshot.XXXXXX")"
+  rollback_dir="$(mktemp -d "$install_dir/.restore-rollback.XXXXXX")"
+  if ! tar -xzf "$archive_file" -C "$staging_dir"; then
+    rm -rf "$staging_dir" "$rollback_dir"
+    die "快照解压失败，未修改现有数据"
+  fi
+
+  docker stop "$CPA_CONTAINER" "$CPAM_CONTAINER" >/dev/null 2>&1 || true
+  for item in docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data; do
+    if [ -e "$install_dir/$item" ]; then
+      mv "$install_dir/$item" "$rollback_dir/" || restore_ok="false"
+    fi
+  done
+  if [ "$restore_ok" = "true" ]; then
+    for item in docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data; do
+      if [ -e "$staging_dir/$item" ]; then
+        mv "$staging_dir/$item" "$install_dir/" || restore_ok="false"
+      fi
+    done
+  fi
+  if [ "$restore_ok" = "true" ]; then
+    compose_in_dir "$install_dir" up -d || restore_ok="false"
+  fi
+  if [ "$restore_ok" = "true" ] && ! validate_snapshot_restore "$install_dir"; then
+    warn "快照文件已恢复，但服务健康验证失败"
+    restore_ok="false"
+  fi
+
+  if [ "$restore_ok" != "true" ]; then
+    warn "恢复未完成，正在自动还原操作前文件"
+    docker stop "$CPA_CONTAINER" "$CPAM_CONTAINER" >/dev/null 2>&1 || true
+    for item in docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data; do
+      rm -rf "${install_dir:?}/$item"
+      [ ! -e "$rollback_dir/$item" ] || mv "$rollback_dir/$item" "$install_dir/"
+    done
+    compose_in_dir "$install_dir" up -d >/dev/null 2>&1 || true
+    rm -rf "$staging_dir" "$rollback_dir"
+    die "恢复失败，已尝试回到操作前状态"
+  fi
+
+  rm -rf "$staging_dir" "$rollback_dir"
+  log "快照恢复完成: $snapshot_id"
+  show_menu_status
+  health_check "$install_dir"
 }
 
 health_check() {
@@ -1195,13 +1564,15 @@ install_cpa_cpam() {
   sleep 8
   show_menu_status
   health_check "$install_dir" "$api_key" "$cpa_host_port" "$cpam_host_port"
+  if ! create_snapshot_record "$install_dir" system initial-install "初始安装" online; then
+    warn "服务已安装成功，但初始安装快照创建失败；请稍后手动创建快照"
+  fi
   print_install_summary "$install_dir" "$api_key" "$mgt_key" "$cpa_host_port" "$cpam_host_port" "$server_ip" "$cpamp_admin_key"
 }
 
 upgrade_cpa_cpam() {
   local detected_dir
   local install_dir
-  local backup_file
   local install_type
   local cpa_target_ref
   local manager_target_ref
@@ -1272,21 +1643,20 @@ upgrade_cpa_cpam() {
     fi
   fi
 
-  backup_file="$install_dir/backups/pre-upgrade-$(timestamp).tar.gz"
   print_section "升级确认"
   printf '安装目录：%s\n' "$install_dir"
-  printf '升级备份：%s\n' "$backup_file"
-  printf '影响范围：备份期间 CPA 和 Manager 会短暂停止；随后重新创建容器。\n'
+  printf '系统快照：升级前自动保存到 %s/system/\n' "$(snapshot_root_dir "$install_dir")"
+  printf '影响范围：创建一致性快照期间 CPA 和 Manager 会短暂停止；随后重新创建容器。\n'
   printf '数据策略：保留 config.yaml、auths、日志和 cpa-manager-data。\n'
   if ! ask_yes_no "已核对版本和影响，确认开始升级" "N"; then
     log "已取消升级；已下载的镜像不会影响当前运行容器"
     return 0
   fi
 
-  create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data || die "升级前一致性备份失败: $backup_file"
+  create_snapshot_record "$install_dir" system pre-upgrade "升级前自动保护" consistent || die "升级前一致性快照失败"
 
   log "应用已确认的镜像并重新创建服务"
-  compose_in_dir "$install_dir" up -d --remove-orphans || die "docker compose up -d 失败；请使用升级前备份排查恢复"
+  compose_in_dir "$install_dir" up -d --remove-orphans || die "docker compose up -d 失败；请使用升级前系统快照排查恢复"
   sleep 8
   show_menu_status
   health_check "$install_dir"
@@ -1381,55 +1751,6 @@ EOF
       docker logs --tail=120 "$manager_container" || true
       ;;
     *) warn "无效选项" ;;
-  esac
-}
-
-backup_cpa_cpam() {
-  local install_dir
-  local backup_file
-  local mode
-
-  install_dir="$(detect_install_dir)"
-  ensure_compose_dir "$install_dir"
-  print_section "选择备份模式"
-  cat <<'EOF'
-1) 快速不停机备份（默认）
-   配置、密钥、认证文件和 SQLite 在线快照；不包含运行日志，服务不中断。
-
-2) 完整一致性备份
-   配置、密钥、认证、日志和完整 Manager 数据；CPA 与 Manager 会短暂停止。
-EOF
-  mode="$(read_with_default "请选择备份模式 [1]: " "1")"
-
-  case "$mode" in
-    1)
-      backup_file="$install_dir/backups/cpa-cpam-online-$(timestamp).tar.gz"
-      print_section "快速不停机备份确认"
-      printf '安装目录：%s\n' "$install_dir"
-      printf '备份文件：%s\n' "$backup_file"
-      printf '影响：服务保持运行；认证文件为尽力快照，SQLite 使用在线备份。\n'
-      if ! ask_yes_no "确认创建快速不停机备份" "Y"; then
-        log "已取消备份"
-        return 0
-      fi
-      create_online_backup_archive "$install_dir" "$backup_file" || die "快速不停机备份失败: $backup_file"
-      ;;
-    2)
-      backup_file="$install_dir/backups/cpa-cpam-consistent-$(timestamp).tar.gz"
-      print_section "完整一致性备份确认"
-      printf '安装目录：%s\n' "$install_dir"
-      printf '备份文件：%s\n' "$backup_file"
-      printf '影响：CPA 和 Manager 会短暂停止并自动恢复。\n'
-      if ! ask_yes_no "确认创建完整一致性备份" "Y"; then
-        log "已取消备份"
-        return 0
-      fi
-      create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths logs cpa-manager-data || die "完整一致性备份失败: $backup_file"
-      ;;
-    *)
-      warn "无效备份模式: $mode"
-      return 1
-      ;;
   esac
 }
 
@@ -1675,18 +1996,17 @@ EOF
     die "未找到当前 Plus 管理员密钥，无法同步 CPA 连接；请选择两个全部重置"
   fi
 
-  backup_file="$install_dir/backups/pre-key-reset-$(timestamp).tar.gz"
   printf '安装目录：%s\n' "$install_dir"
   printf '重置范围：%s\n' "$choice"
-  printf '安全快照：%s\n' "$backup_file"
+  printf '安全快照：操作前自动保存到 %s/system/\n' "$(snapshot_root_dir "$install_dir")"
   printf '影响：重置期间相关服务会短暂停止；新密钥只在全部验证成功后显示。\n'
   if ! ask_yes_no "确认重新生成并覆盖所选管理密钥" "Y"; then
     log "已取消密钥重置"
     return 0
   fi
 
-  create_consistent_backup_archive "$install_dir" "$backup_file" all \
-    docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data || die "密钥重置前快照失败"
+  create_snapshot_record "$install_dir" system pre-key-reset "管理密钥重置前自动保护" consistent || die "密钥重置前快照失败"
+  backup_file="$CREATED_SNAPSHOT_DIR/snapshot.tar.gz"
 
   active_plus_key="$old_plus_key"
   if [ -n "$new_plus_key" ]; then
@@ -2202,7 +2522,7 @@ migrate_cpa_cpam() {
     return 0
   fi
 
-  snapshot_dir="$install_dir/backups/migration-$(timestamp)"
+  snapshot_dir="$install_dir/snapshots/migration/migration-$(timestamp)"
   backup_file="$snapshot_dir/pre-migration.tar.gz"
   temp_compose="$install_dir/docker-compose.yml.cpamp.tmp"
   mkdir -p "$snapshot_dir"
@@ -2250,7 +2570,7 @@ EOF
 
   docker rm "$LEGACY_CPAM_CONTAINER" >/dev/null || warn "旧 Manager 容器删除失败，请确认其保持停止"
   if ! create_consistent_backup_archive "$install_dir" "$snapshot_dir/post-migration.tar.gz" manager docker-compose.yml .secrets.txt cpa-manager-data; then
-    warn "迁移已成功，但迁移后备份失败；Plus 已尝试恢复运行，请稍后执行 backup"
+    warn "迁移已成功，但迁移后快照失败；Plus 已尝试恢复运行，请稍后执行 snapshot"
   fi
   log "迁移成功。访问地址和端口保持不变: http://服务器IP:${cpam_host_port}/management.html"
   log "如需回滚，请运行: bash cpa-cpam-manager.sh rollback"
@@ -2279,7 +2599,9 @@ print_help() {
   restart    重启
   status     状态 / 健康检查
   logs       查看日志
-  backup     备份
+  snapshot   创建快照
+  snapshots  查看现有快照
+  restore-snapshot  恢复快照
   keys       查看密钥 / 地址
   uninstall  卸载
   help       显示帮助
@@ -2313,9 +2635,10 @@ CPA Manager Plus 运维控制台
   5) 重启                     6) 状态 / 健康检查
 
 运行维护
-  7) 查看日志                 8) 创建备份
+  7) 查看日志                 8) 创建快照
   9) 查看密钥 / 地址         10) Codex OAuth 登录
- 17) 重新生成管理密钥
+ 17) 重新生成管理密钥        18) 查看现有快照
+ 19) 恢复快照
 
 数据与迁移
  11) 迁移预检               12) 查看迁移计划
@@ -2327,7 +2650,7 @@ CPA Manager Plus 运维控制台
   0) 退出
 ────────────────────────────────────────────────────────
 EOF
-    printf "请选择操作 [0-17]: "
+    printf "请选择操作 [0-19]: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -2337,7 +2660,7 @@ EOF
       5) restart_cpa_cpam ;;
       6) status_cpa_cpam ;;
       7) logs_cpa_cpam ;;
-      8) backup_cpa_cpam ;;
+      8) create_snapshot ;;
       9) show_keys ;;
       10) codex_login_hint ;;
       11) preflight_cpa_cpam ;;
@@ -2347,6 +2670,8 @@ EOF
       15) security_audit ;;
       16) uninstall_cpa_cpam ;;
       17) reset_management_keys ;;
+      18) list_snapshots ;;
+      19) restore_snapshot ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
@@ -2389,7 +2714,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|logs|backup|keys|reset-keys|uninstall|codex-login|security)
+    menu|install|upgrade|start|stop|restart|status|logs|snapshot|snapshots|restore-snapshot|keys|reset-keys|uninstall|codex-login|security)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -2408,7 +2733,9 @@ main() {
     restart) restart_cpa_cpam ;;
     status) status_cpa_cpam ;;
     logs) logs_cpa_cpam ;;
-    backup) backup_cpa_cpam ;;
+    snapshot) create_snapshot ;;
+    snapshots) list_snapshots ;;
+    restore-snapshot) restore_snapshot ;;
     keys) show_keys ;;
     reset-keys) reset_management_keys ;;
     uninstall) uninstall_cpa_cpam ;;
