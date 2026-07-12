@@ -45,8 +45,8 @@ printf '[附加 3/4] 升级版本展示模拟检查\n'
 bash "$ROOT_DIR/scripts/test-upgrade-version.sh" >/dev/null
 printf '升级版本展示模拟检查通过。\n'
 
-printf '[附加 4/4] 安全巡检 IP 提取模拟检查\n'
+printf '[附加 4/4] 消费与管理行为审计分离模拟检查\n'
 bash "$ROOT_DIR/scripts/test-security-audit.sh" >/dev/null
-printf '安全巡检 IP 提取模拟检查通过。\n'
+printf '消费与管理行为审计分离模拟检查通过。\n'
 
 printf '静态检查完成。\n'

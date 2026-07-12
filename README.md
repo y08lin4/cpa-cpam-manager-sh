@@ -29,6 +29,7 @@
 - 提供只读迁移预检、dry-run、正式迁移、自动回滚和手工回滚。
 - 提供可备注、可查看、可恢复的快照管理，以及升级、迁移和密钥重置前的自动保护点。
 - 检查 CPA API、Plus `/health`、兼容端点和鉴权状态。
+- 将消费行为与管理行为拆成两个一级审计入口，两套审计分别展示成功和失败 IP。
 - 提供日志、密钥查看、Codex OAuth、卸载和 UFW 端口管理。
 
 ## 部署结构
@@ -131,7 +132,8 @@ bash cpa-cpam-manager.sh snapshots
 | `migrate --dry-run` | 输出迁移计划，不修改文件或停止容器 |
 | `migrate` | 正式迁移旧 CPA-Manager，并在失败时自动回滚 |
 | `rollback` | 恢复最近一次迁移前快照 |
-| `security` | 查看 24 小时成功/失败调用 IP 排名和公网归属 |
+| `audit-consumption` | 消费行为审计，分别显示消费成功和消费失败 IP 排名 |
+| `audit-management` | 管理行为审计，分别显示管理成功、失败 IP 排名和操作明细 |
 | `start` | 启动 Compose 服务 |
 | `stop` | 停止 Compose 服务 |
 | `restart` | 重启 Compose 服务 |
@@ -285,17 +287,23 @@ bash cpa-cpam-manager.sh upgrade
 
 若两个服务均为最新镜像，脚本默认退出，不会无意义重建容器。
 
-### 安全巡检
+### 消费行为与管理行为审计
 
 ```bash
-bash cpa-cpam-manager.sh security
+bash cpa-cpam-manager.sh audit-consumption
+bash cpa-cpam-manager.sh audit-management
 ```
 
-安全巡检会从最近 24 小时的 CLIProxyAPI 容器日志和文件日志中提取来源 IPv4/IPv6，并分成“成功调用 IP 排名”和“失败调用 IP 排名”两部分，各显示前 30 个来源。HTTP 2xx 计为成功，HTTP 4xx/5xx 或明确失败关键词计为失败；没有明确调用结果的日志不会混入排名。公网、内网和回环地址都会统计，内网与本地地址会在归属列中单独标记。脚本还会统计常见 401、403、unauthorized、forbidden 等鉴权失败线索。
+审计功能读取最近 24 小时的 CLIProxyAPI、CPA Manager Plus 容器日志和 CLIProxyAPI 文件日志，但两套结果完全分开：
+
+- 消费行为审计只统计 `/v1/chat/completions`、`/v1/responses`、图像、视频、Gemini 和 Codex 等实际模型消费路径，分别输出“消费成功 IP 排名”和“消费失败 IP 排名”。
+- 管理行为审计只统计 `/v0/management/*`、Plus 配置、处理策略、配额冷却和初始化等管理路径，分别输出“管理操作成功 IP 排名”和“管理操作失败 IP 排名”，并额外展示方法、路径和结果汇总。
+
+`/health`、`/status`、`/v1/models`、管理页面和静态资源只计入过滤数量，不进入任何榜单；无法分类的路径只显示诊断数量，也不会混入消费或管理审计。HTTP 2xx 计为成功，HTTP 4xx/5xx 计为失败。公网、内网和回环地址都会在本地统计，401、403 会在所属行为审计中单独提示。
 
 经用户确认后，脚本会把两张榜单前 30 名中去重后的公网 IP 通过 [IP-API Batch](https://ip-api.com/docs/api:batch) 批量查询国家、地区、城市、ASN、运营商、代理和机房标记。单批最多发送 100 个公网 IP；内网和回环地址不会发送。免费 Batch 端点使用 HTTP，脚本会在调用前明确提示这一隐私与传输风险；接口失败或限流不会影响本地排行榜。
 
-访问日志按 CLIProxyAPI 官方格式解析：日志前缀之后依次为 HTTP 状态码、耗时、客户端 IP、方法和路径。若日志存在但没有匹配记录，脚本会给出查看容器日志和 `logs/main.log` 的诊断命令。
+解析器同时支持 CLIProxyAPI 的 Gin 访问日志格式和 Plus 的 `http 方法 路径 status=... remote=...` 官方格式。旧命令 `security` 保留为消费行为审计的兼容别名，不再输出混合榜单。
 
 升级前自动创建：
 

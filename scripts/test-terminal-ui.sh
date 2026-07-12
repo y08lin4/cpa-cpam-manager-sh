@@ -49,6 +49,14 @@ if grep -Fq '1455' <<<"$OUTPUT"; then
   exit 1
 fi
 
+MENU_OUTPUT="$(print_main_menu)"
+grep -Fq '15) 消费行为审计' <<<"$MENU_OUTPUT"
+grep -Fq '20) 管理行为审计' <<<"$MENU_OUTPUT"
+if grep -Fq '安全巡检 / 24h IP' <<<"$MENU_OUTPUT"; then
+  printf '主菜单不应继续显示混合行为的旧安全巡检入口。\n' >&2
+  exit 1
+fi
+
 # 验证全局确认默认值生效，且非交互环境不会因为默认 Y 自动执行。
 if [ "$CONFIRM_DEFAULT" != "Y" ]; then
   printf '全局确认默认值应为 Y。\n' >&2

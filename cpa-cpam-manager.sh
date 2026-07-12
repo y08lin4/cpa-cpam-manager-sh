@@ -2093,8 +2093,8 @@ docker compose exec cli-proxy-api /CLIProxyAPI/CLIProxyAPI -no-browser --codex-l
 EOF
 }
 
-# 从最近 24 小时的容器日志和文件日志中提取有效 IP，包括公网、内网和回环地址。
-# 仅将带有明确结果的请求计入榜单：HTTP 2xx 视为成功，HTTP 4xx/5xx 或明确失败关键词视为失败。
+# 从最近 24 小时的两个容器和文件日志中提取访问记录，并按消费行为、管理行为严格分类。
+# 仅将带有明确路径和结果的请求计入榜单，避免健康检查、静态资源和普通日志污染统计。
 collect_recent_access_ips() {
   local install_dir="$1"
   local log_sample="$2"
@@ -2103,6 +2103,9 @@ collect_recent_access_ips() {
   : > "$log_sample"
   if container_exists "$CPA_CONTAINER"; then
     docker logs --since 24h "$CPA_CONTAINER" >> "$log_sample" 2>&1 || true
+  fi
+  if container_exists "$CPAM_CONTAINER"; then
+    docker logs --since 24h "$CPAM_CONTAINER" >> "$log_sample" 2>&1 || true
   fi
 
   if [ -d "$install_dir/logs" ]; then
@@ -2121,72 +2124,158 @@ import collections
 import ipaddress
 import re
 import sys
+from urllib.parse import urlsplit
 
 path = sys.argv[1]
 lines = open(path, "r", encoding="utf-8", errors="ignore")
-ip_patterns = [
-    r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])",
-    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])",
-]
-status_patterns = [
-    re.compile(r'\b(?:status(?:_code)?|http_status|code)\s*[:=]\s*["\']?([1-5][0-9]{2})\b', re.I),
-    re.compile(r'"\s+([1-5][0-9]{2})\s+(?:[0-9]+|-)'),
-    # CLIProxyAPI 官方 LogFormatter：日志前缀结束后直接输出“状态码 | 耗时 | IP”。
-    re.compile(r'(?:^|\]\s+)([1-5][0-9]{2})\s*\|'),
-    re.compile(r'\|\s*([1-5][0-9]{2})\s*\|'),
-]
-failure_pattern = re.compile(
-    r'\b(?:unauthorized|forbidden|authentication failed|invalid\s+(?:api[-_ ]?)?(?:key|token)|'
-    r'request failed|upstream failed|timeout|timed out|connection refused)\b',
+
+# CLIProxyAPI Gin 日志与 CPA Manager Plus RequestLogger 的官方格式。
+cli_access = re.compile(
+    r'(?P<status>[1-5][0-9]{2})\s*\|[^|]*\|\s*(?P<remote>[^|]+?)\s*\|\s*'
+    r'(?P<method>GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+"(?P<path>[^"]+)"',
     re.I,
 )
-counts = {
-    "success": collections.Counter(),
-    "failure": collections.Counter(),
-    "auth_failure": collections.Counter(),
+plus_access = re.compile(
+    r'\bhttp\s+(?P<method>GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+(?P<path>\S+)\s+'
+    r'status=(?P<status>[1-5][0-9]{2})\b.*?\bremote=(?P<remote>\S+)',
+    re.I,
+)
+
+consumption_exact = {
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/moderations",
+    "/v1/messages",
+    "/v1/responses",
+    "/v1/responses/compact",
+    "/v1beta/interactions",
 }
+consumption_prefixes = (
+    "/v1/images/",
+    "/v1/videos",
+    "/v1/audio/",
+    "/openai/v1/videos",
+    "/backend-api/codex/responses",
+    "/v1beta/models/",
+)
+management_exact = {
+    "/v0/management",
+    "/usage-service/config",
+    "/usage-service/account-processing-policy",
+    "/usage-service/quota-cooldowns",
+    "/setup",
+}
+management_prefixes = ("/v0/management/",)
+filtered_exact = {
+    "/",
+    "/health",
+    "/healthz",
+    "/status",
+    "/usage-service/info",
+    "/management.html",
+    "/v1/models",
+    "/v1/messages/count_tokens",
+    "/v1beta/models",
+    "/models",
+}
+filtered_prefixes = (
+    "/assets/",
+    "/static/",
+    "/favicon",
+    "/v0/resource/plugins/",
+    "/anthropic/callback",
+    "/codex/callback",
+    "/antigravity/callback",
+)
+
+ip_counts = {
+    behavior: {outcome: collections.Counter() for outcome in ("success", "failure")}
+    for behavior in ("consumption", "management")
+}
+auth_failures = {
+    "consumption": collections.Counter(),
+    "management": collections.Counter(),
+}
+management_events = collections.Counter()
+diagnostics = collections.Counter()
+seen_lines = set()
+
+
+def parse_remote(raw):
+    value = raw.strip().strip('"')
+    if value.startswith("[") and "]" in value:
+        value = value[1:value.index("]")]
+    else:
+        try:
+            return ipaddress.ip_address(value)
+        except ValueError:
+            if value.count(":") == 1:
+                value = value.rsplit(":", 1)[0]
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
+
+
+def classify_path(request_path):
+    clean_path = urlsplit(request_path).path.rstrip("/") or "/"
+    if clean_path in consumption_exact or clean_path.startswith(consumption_prefixes):
+        return "consumption", clean_path
+    if clean_path in management_exact or clean_path.startswith(management_prefixes):
+        return "management", clean_path
+    if clean_path in filtered_exact or clean_path.startswith(filtered_prefixes):
+        return "filtered", clean_path
+    return "unclassified", clean_path
+
 
 for line in lines:
-    addresses = set()
-    for pattern in ip_patterns:
-      for candidate in re.findall(pattern, line):
-        try:
-            address = ipaddress.ip_address(candidate)
-        except ValueError:
-            continue
-        # 组播和未指定地址不是有效调用来源；内网、链路本地和回环地址仍需统计。
-        if not address.is_multicast and not address.is_unspecified:
-            addresses.add(str(address))
-
-    if not addresses:
+    # 同一条 CLIProxyAPI 日志可能同时出现在容器输出和文件日志中，只统计一次。
+    if line in seen_lines:
+        continue
+    seen_lines.add(line)
+    match = cli_access.search(line) or plus_access.search(line)
+    if not match:
+        continue
+    address = parse_remote(match.group("remote"))
+    if address is None or address.is_multicast or address.is_unspecified:
+        diagnostics["invalid_ip"] += 1
         continue
 
-    status = None
-    for pattern in status_patterns:
-        match = pattern.search(line)
-        if match:
-            status = int(match.group(1))
-            break
+    status = int(match.group("status"))
+    method = match.group("method").upper()
+    behavior, request_path = classify_path(match.group("path"))
+    if behavior in ("filtered", "unclassified"):
+        diagnostics[behavior] += 1
+        continue
+    if 200 <= status < 300:
+        outcome = "success"
+    elif 400 <= status < 600:
+        outcome = "failure"
+    else:
+        diagnostics["no_result"] += 1
+        continue
 
-    category = None
-    if status is not None:
-        if 200 <= status < 300:
-            category = "success"
-        elif 400 <= status < 600:
-            category = "failure"
-    elif failure_pattern.search(line):
-        category = "failure"
+    normalized_address = str(address)
+    ip_counts[behavior][outcome][normalized_address] += 1
+    if status in (401, 403):
+        auth_failures[behavior][normalized_address] += 1
+    if behavior == "management":
+        management_events[(outcome, method, request_path)] += 1
 
-    if category:
-        for address in addresses:
-            counts[category][address] += 1
-            if status in (401, 403):
-                counts["auth_failure"][address] += 1
-
-for category in ("success", "failure", "auth_failure"):
-    for address, count in counts[category].most_common():
+for behavior in ("consumption", "management"):
+    for outcome in ("success", "failure"):
+        for address, count in ip_counts[behavior][outcome].most_common():
+            scope = "public" if ipaddress.ip_address(address).is_global else "internal"
+            print(f"ip\t{behavior}\t{outcome}\t{count}\t{address}\t{scope}")
+    for address, count in auth_failures[behavior].most_common():
         scope = "public" if ipaddress.ip_address(address).is_global else "internal"
-        print(f"{category}\t{count}\t{address}\t{scope}")
+        print(f"auth\t{behavior}\t{count}\t{address}\t{scope}")
+
+for (outcome, method, request_path), count in management_events.most_common(30):
+    print(f"event\t{outcome}\t{count}\t{method}\t{request_path}")
+for name in ("filtered", "unclassified", "invalid_ip", "no_result"):
+    print(f"diagnostic\t{name}\t{diagnostics[name]}")
 PY
 }
 
@@ -2299,18 +2388,54 @@ query_ranked_ip_geolocation() {
   log "IP-API Batch 归属查询完成"
 }
 
-security_audit() {
+# 管理行为除 IP 排名外，再显示方法和脱敏路径，帮助判断发生了查看、修改还是删除操作。
+print_management_event_summary() {
+  local event_report="$1"
+
+  print_section "管理操作明细（前 30）"
+  if [ ! -s "$event_report" ]; then
+    printf '%b  最近 24 小时未识别到管理操作\n' "$ICON_OK"
+    return 0
+  fi
+  printf '%-8s %-8s %-8s %s\n' '结果' '次数' '方法' '管理路径'
+  printf '%s\n' '────────────────────────────────────────────────────────────────────────────────────────'
+  head -n 30 "$event_report" | awk -F '\t' '
+    {
+      result = ($1 == "success") ? "成功" : "失败"
+      printf "%-8s %-8s %-8s %s\n", result, $2, $3, $4
+    }'
+}
+
+behavior_audit() {
+  local behavior="$1"
   local install_dir
   local temp_dir
   local log_sample
   local ip_report
   local success_report
   local failure_report
+  local event_report
+  local behavior_label
   local auth_failures
   local total_sources
   local success_calls
   local failure_calls
   local sample_lines
+  local filtered_requests
+  local unclassified_requests
+  local title_prefix
+
+  case "$behavior" in
+    consumption)
+      behavior_label="消费行为"
+      title_prefix="消费"
+      ;;
+    management)
+      behavior_label="管理行为"
+      title_prefix="管理操作"
+      ;;
+    *) die "未知审计类型: $behavior" ;;
+  esac
 
   install_dir="$(detect_install_dir)"
   temp_dir="$(mktemp -d)"
@@ -2318,9 +2443,10 @@ security_audit() {
   ip_report="$temp_dir/ip-report.tsv"
   success_report="$temp_dir/success-report.tsv"
   failure_report="$temp_dir/failure-report.tsv"
+  event_report="$temp_dir/management-events.tsv"
 
-  print_section "24 小时访问来源巡检"
-  printf '说明：结果来自现有日志，是辅助安全线索，不等同于入侵结论。\n'
+  print_section "24 小时${behavior_label}审计"
+  printf '说明：只统计已识别的%s接口；结果来自现有日志，是辅助审计线索。\n' "$behavior_label"
   printf '时间范围：最近 24 小时\n'
   printf '安装目录：%s\n' "$install_dir"
 
@@ -2328,33 +2454,52 @@ security_audit() {
     rm -rf "$temp_dir"
     die "无法解析最近 24 小时访问 IP"
   fi
-  awk -F '\t' '$1 == "success" { print $2 "\t" $3 "\t" $4 }' "$ip_report" > "$success_report"
-  awk -F '\t' '$1 == "failure" { print $2 "\t" $3 "\t" $4 }' "$ip_report" > "$failure_report"
-  auth_failures="$(awk -F '\t' '$1 == "auth_failure" { total += $2 } END { print total + 0 }' "$ip_report")"
-  total_sources="$(cut -f 3 "$ip_report" | sort -u | grep -c . || true)"
+  awk -F '\t' -v behavior="$behavior" '$1 == "ip" && $2 == behavior && $3 == "success" { print $4 "\t" $5 "\t" $6 }' "$ip_report" > "$success_report"
+  awk -F '\t' -v behavior="$behavior" '$1 == "ip" && $2 == behavior && $3 == "failure" { print $4 "\t" $5 "\t" $6 }' "$ip_report" > "$failure_report"
+  awk -F '\t' '$1 == "event" { print $2 "\t" $3 "\t" $4 "\t" $5 }' "$ip_report" > "$event_report"
+  auth_failures="$(awk -F '\t' -v behavior="$behavior" '$1 == "auth" && $2 == behavior { total += $3 } END { print total + 0 }' "$ip_report")"
+  total_sources="$({ cut -f 2 "$success_report"; cut -f 2 "$failure_report"; } | sort -u | grep -c . || true)"
   success_calls="$(awk -F '\t' '{ total += $1 } END { print total + 0 }' "$success_report")"
   failure_calls="$(awk -F '\t' '{ total += $1 } END { print total + 0 }' "$failure_report")"
   sample_lines="$(wc -l < "$log_sample" | tr -d ' ')"
+  filtered_requests="$(awk -F '\t' '$1 == "diagnostic" && $2 == "filtered" { print $3 + 0 }' "$ip_report")"
+  unclassified_requests="$(awk -F '\t' '$1 == "diagnostic" && $2 == "unclassified" { print $3 + 0 }' "$ip_report")"
+  filtered_requests="${filtered_requests:-0}"
+  unclassified_requests="${unclassified_requests:-0}"
 
   printf '\n日志采样：%s 行\n' "$sample_lines"
-  printf '\n已识别调用来源 IP：%s 个\n' "$total_sources"
-  printf '成功调用：%s 次    失败调用：%s 次\n' "$success_calls" "$failure_calls"
+  printf '已过滤健康检查、模型列表和静态资源：%s 条\n' "$filtered_requests"
+  printf '未分类请求：%s 条（不进入任何榜单）\n' "$unclassified_requests"
+  printf '\n已识别%s来源 IP：%s 个\n' "$behavior_label" "$total_sources"
+  printf '成功：%s 次    失败：%s 次\n' "$success_calls" "$failure_calls"
   if [ "$auth_failures" -gt 0 ]; then
-    printf '疑似鉴权失败日志：%b  %s 条，请结合日志复核\n' "$ICON_WARN" "$auth_failures"
+    printf '401 / 403 鉴权失败：%b  %s 条，请结合日志复核\n' "$ICON_WARN" "$auth_failures"
   else
-    printf '疑似鉴权失败日志：%b  未发现\n' "$ICON_OK"
+    printf '401 / 403 鉴权失败：%b  未发现\n' "$ICON_OK"
   fi
   query_ranked_ip_geolocation "$success_report" "$failure_report" "$temp_dir/geo-report.tsv" "$temp_dir" || true
-  print_access_ip_ranking "成功调用 IP 排名（前 30）" "$success_report" "最近 24 小时未识别到成功调用" "$temp_dir/geo-report.tsv"
-  print_access_ip_ranking "失败调用 IP 排名（前 30）" "$failure_report" "最近 24 小时未识别到失败调用" "$temp_dir/geo-report.tsv"
-  printf '\n说明：仅统计日志中带明确 HTTP 结果的来源 IP；2xx 计为成功，4xx/5xx 或明确失败关键词计为失败。\n'
+  print_access_ip_ranking "${title_prefix}成功 IP 排名（前 30）" "$success_report" "最近 24 小时未识别到${title_prefix}成功记录" "$temp_dir/geo-report.tsv"
+  print_access_ip_ranking "${title_prefix}失败 IP 排名（前 30）" "$failure_report" "最近 24 小时未识别到${title_prefix}失败记录" "$temp_dir/geo-report.tsv"
+  if [ "$behavior" = "management" ]; then
+    print_management_event_summary "$event_report"
+  fi
+  printf '\n说明：2xx 计为成功，4xx/5xx 计为失败；消费和管理路径使用相互独立的白名单。\n'
   if [ "$sample_lines" -gt 0 ] && [ "$success_calls" -eq 0 ] && [ "$failure_calls" -eq 0 ]; then
-    warn "日志存在但格式未被识别，请运行以下命令查看原始访问记录："
+    warn "日志存在但没有识别到${behavior_label}，请结合未分类数量并查看原始访问记录："
     printf 'docker logs --since 24h %s | tail -n 50\n' "$CPA_CONTAINER"
+    printf 'docker logs --since 24h %s | tail -n 50\n' "$CPAM_CONTAINER"
     printf 'tail -n 50 %s/logs/main.log\n' "$install_dir"
   fi
 
   rm -rf "$temp_dir"
+}
+
+consumption_audit() {
+  behavior_audit consumption
+}
+
+management_audit() {
+  behavior_audit management
 }
 
 # -----------------------------------------------------------------------------
@@ -2592,7 +2737,8 @@ print_help() {
   preflight  只读检查当前安装和迁移条件
   migrate    正式迁移旧 Manager（可加 --dry-run）
   rollback   回滚最近一次迁移
-  security   查看 24 小时成功/失败调用 IP 排名和公网归属
+  audit-consumption  消费行为审计：分别查看成功和失败 IP 排名
+  audit-management   管理行为审计：分别查看成功和失败 IP 排名及操作明细
   reset-keys 重新生成 Plus 管理员密钥、CPA Management Key 或两者
   start      启动
   stop       停止
@@ -2620,12 +2766,8 @@ print_help() {
 EOF
 }
 
-menu_loop() {
-  local choice
-  while true; do
-    clear_screen
-    show_menu_status
-    cat <<'EOF'
+print_main_menu() {
+  cat <<'EOF'
 
 CPA Manager Plus 运维控制台
 ────────────────────────────────────────────────────────
@@ -2644,13 +2786,24 @@ CPA Manager Plus 运维控制台
  11) 迁移预检               12) 查看迁移计划
  13) 正式迁移到 Plus        14) 回滚最近迁移
 
+审计与安全
+ 15) 消费行为审计           20) 管理行为审计
+
 其他
- 15) 安全巡检 / 24h IP      16) 卸载
+ 16) 卸载
 
   0) 退出
 ────────────────────────────────────────────────────────
 EOF
-    printf "请选择操作 [0-19]: "
+}
+
+menu_loop() {
+  local choice
+  while true; do
+    clear_screen
+    show_menu_status
+    print_main_menu
+    printf "请选择操作 [0-20]: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -2667,11 +2820,12 @@ EOF
       12) migrate_dry_run ;;
       13) migrate_cpa_cpam ;;
       14) rollback_cpa_cpam ;;
-      15) security_audit ;;
+      15) consumption_audit ;;
       16) uninstall_cpa_cpam ;;
       17) reset_management_keys ;;
       18) list_snapshots ;;
       19) restore_snapshot ;;
+      20) management_audit ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
@@ -2714,7 +2868,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|logs|snapshot|snapshots|restore-snapshot|keys|reset-keys|uninstall|codex-login|security)
+    menu|install|upgrade|start|stop|restart|status|logs|snapshot|snapshots|restore-snapshot|keys|reset-keys|uninstall|codex-login|security|audit-consumption|audit-management)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -2740,7 +2894,8 @@ main() {
     reset-keys) reset_management_keys ;;
     uninstall) uninstall_cpa_cpam ;;
     codex-login) codex_login_hint ;;
-    security) security_audit ;;
+    security|audit-consumption) consumption_audit ;;
+    audit-management) management_audit ;;
   esac
 }
 
