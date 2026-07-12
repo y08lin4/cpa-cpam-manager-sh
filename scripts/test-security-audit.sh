@@ -88,16 +88,23 @@ if grep -Eq '8\.8\.8\.8|/v1/chat/completions' <<<"$MANAGEMENT_OUTPUT"; then
 fi
 
 # 模拟 IP-API Batch，验证只有公网 IP 被发送，归属结果可回填到榜单。
-if command -v jq >/dev/null 2>&1; then
-  cat > "$TEMP_DIR/success.tsv" <<'EOF'
+cat > "$TEMP_DIR/success.tsv" <<'EOF'
 2	8.8.8.8	public
 1	192.168.1.20	internal
 EOF
-  cat > "$TEMP_DIR/failure.tsv" <<'EOF'
+cat > "$TEMP_DIR/failure.tsv" <<'EOF'
 1	1.1.1.1	public
 1	10.0.0.8	internal
 EOF
+collect_ranked_public_ips "$TEMP_DIR/success.tsv" "$TEMP_DIR/failure.tsv" "$TEMP_DIR/public-ips.txt"
+grep -Fxq '8.8.8.8' "$TEMP_DIR/public-ips.txt"
+grep -Fxq '1.1.1.1' "$TEMP_DIR/public-ips.txt"
+if grep -Eq '192\.168\.1\.20|10\.0\.0\.8' "$TEMP_DIR/public-ips.txt"; then
+  printf '公共公网 IP 清单函数不应包含内网地址。\n' >&2
+  exit 1
+fi
 
+if command -v jq >/dev/null 2>&1; then
   ask_yes_no() {
     return 0
   }

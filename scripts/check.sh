@@ -33,20 +33,24 @@ else
   printf '未安装 shellcheck，已跳过；建议安装后重新执行。\n'
 fi
 
-printf '[附加 1/4] 终端界面模拟检查\n'
+printf '[附加 1/5] 终端界面模拟检查\n'
 bash "$ROOT_DIR/scripts/test-terminal-ui.sh" >/dev/null
 printf '终端界面模拟检查通过。\n'
 
-printf '[附加 2/4] 一致性备份模拟检查\n'
+printf '[附加 2/5] 一致性快照模拟检查\n'
 bash "$ROOT_DIR/scripts/test-consistent-backup.sh" >/dev/null
-printf '一致性备份模拟检查通过。\n'
+printf '一致性快照模拟检查通过。\n'
 
-printf '[附加 3/4] 升级版本展示模拟检查\n'
+printf '[附加 3/5] 升级版本展示模拟检查\n'
 bash "$ROOT_DIR/scripts/test-upgrade-version.sh" >/dev/null
 printf '升级版本展示模拟检查通过。\n'
 
-printf '[附加 4/4] 消费与管理行为审计分离模拟检查\n'
+printf '[附加 4/5] 消费与管理行为审计分离模拟检查\n'
 bash "$ROOT_DIR/scripts/test-security-audit.sh" >/dev/null
 printf '消费与管理行为审计分离模拟检查通过。\n'
+
+printf '[附加 5/5] 配置体检模拟检查\n'
+bash "$ROOT_DIR/scripts/test-configuration-doctor.sh" >/dev/null
+printf '配置体检模拟检查通过。\n'
 
 printf '静态检查完成。\n'

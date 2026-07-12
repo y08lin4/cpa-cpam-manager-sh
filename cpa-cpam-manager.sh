@@ -4,6 +4,7 @@ set -Eeuo pipefail
 DEFAULT_INSTALL_DIR="/opt/cliproxy-cpam"
 DEFAULT_CPA_HOST_PORT="8317"
 DEFAULT_CPAM_HOST_PORT="18317"
+SCRIPT_VERSION="2026.07.12"
 CPA_IMAGE="${CPA_IMAGE:-eceasy/cli-proxy-api:latest}"
 CPAM_IMAGE="${CPAM_IMAGE:-seakee/cpa-manager-plus:latest}"
 OLD_PANEL_CONTAINER="cpa-management-center"
@@ -310,33 +311,13 @@ container_exists() {
 }
 
 active_cpam_container() {
-  if container_exists "$CPAM_CONTAINER"; then
-    printf '%s\n' "$CPAM_CONTAINER"
-  elif container_exists "$LEGACY_CPAM_CONTAINER"; then
-    printf '%s\n' "$LEGACY_CPAM_CONTAINER"
-  else
-    printf '%s\n' "$CPAM_CONTAINER"
-  fi
+  collect_runtime_status
+  printf '%s\n' "$RUNTIME_MANAGER_CONTAINER"
 }
 
 detect_install_type() {
-  local has_plus="false"
-  local has_legacy="false"
-
-  container_exists "$CPAM_CONTAINER" && has_plus="true"
-  container_exists "$LEGACY_CPAM_CONTAINER" && has_legacy="true"
-
-  if [ "$has_plus" = "true" ] && [ "$has_legacy" = "true" ]; then
-    printf 'mixed\n'
-  elif [ "$has_plus" = "true" ]; then
-    printf 'plus\n'
-  elif [ "$has_legacy" = "true" ]; then
-    printf 'legacy\n'
-  elif container_exists "$CPA_CONTAINER"; then
-    printf 'cpa-only\n'
-  else
-    printf 'not-installed\n'
-  fi
+  collect_runtime_status
+  printf '%s\n' "$RUNTIME_INSTALL_TYPE"
 }
 
 container_primary_port() {
@@ -351,40 +332,124 @@ container_primary_port() {
   fi
 }
 
-# 使用多行状态卡代替 Docker 原始端口列表，避免在窄终端中产生超长横向输出。
-container_status_card() {
+# 统一采集安装类型、容器、镜像、镜像 ID、状态和主端口，供菜单、状态、升级和迁移复用。
+RUNTIME_INSTALL_DIR=""
+RUNTIME_INSTALL_TYPE="not-installed"
+RUNTIME_MANAGER_CONTAINER="$CPAM_CONTAINER"
+RUNTIME_CPA_EXISTS="false"
+RUNTIME_CPA_STATE="not-installed"
+RUNTIME_CPA_IMAGE=""
+RUNTIME_CPA_IMAGE_ID=""
+RUNTIME_CPA_PORT="未映射"
+RUNTIME_PLUS_EXISTS="false"
+RUNTIME_PLUS_STATE="not-installed"
+RUNTIME_PLUS_IMAGE=""
+RUNTIME_PLUS_IMAGE_ID=""
+RUNTIME_PLUS_PORT="未映射"
+RUNTIME_LEGACY_EXISTS="false"
+RUNTIME_LEGACY_STATE="not-installed"
+RUNTIME_LEGACY_IMAGE=""
+RUNTIME_LEGACY_IMAGE_ID=""
+RUNTIME_LEGACY_PORT="未映射"
+
+collect_container_runtime() {
   local name="$1"
-  local label="$2"
-  local internal_port="$3"
-  local legacy="${4:-false}"
-  local image
-  local state
-  local port
+  local internal_port="$2"
+  local prefix="$3"
+  local exists="false"
+  local state="not-installed"
+  local image=""
+  local image_id=""
+  local port="未映射"
+
+  if container_exists "$name"; then
+    exists="true"
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || printf 'unknown')"
+    image="$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || true)"
+    image_id="$(docker inspect -f '{{.Image}}' "$name" 2>/dev/null || true)"
+    port="$(container_primary_port "$name" "$internal_port")"
+  fi
+  printf -v "RUNTIME_${prefix}_EXISTS" '%s' "$exists"
+  printf -v "RUNTIME_${prefix}_STATE" '%s' "$state"
+  printf -v "RUNTIME_${prefix}_IMAGE" '%s' "$image"
+  printf -v "RUNTIME_${prefix}_IMAGE_ID" '%s' "$image_id"
+  printf -v "RUNTIME_${prefix}_PORT" '%s' "$port"
+}
+
+collect_runtime_status() {
+  local install_dir="${1:-}"
+
+  collect_container_runtime "$CPA_CONTAINER" "$CPA_INTERNAL_PORT" CPA
+  collect_container_runtime "$CPAM_CONTAINER" "$CPAM_INTERNAL_PORT" PLUS
+  collect_container_runtime "$LEGACY_CPAM_CONTAINER" "$CPAM_INTERNAL_PORT" LEGACY
+
+  if [ "$RUNTIME_PLUS_EXISTS" = "true" ] && [ "$RUNTIME_LEGACY_EXISTS" = "true" ]; then
+    RUNTIME_INSTALL_TYPE="mixed"
+    RUNTIME_MANAGER_CONTAINER="$CPAM_CONTAINER"
+  elif [ "$RUNTIME_PLUS_EXISTS" = "true" ]; then
+    RUNTIME_INSTALL_TYPE="plus"
+    RUNTIME_MANAGER_CONTAINER="$CPAM_CONTAINER"
+  elif [ "$RUNTIME_LEGACY_EXISTS" = "true" ]; then
+    RUNTIME_INSTALL_TYPE="legacy"
+    RUNTIME_MANAGER_CONTAINER="$LEGACY_CPAM_CONTAINER"
+  elif [ "$RUNTIME_CPA_EXISTS" = "true" ]; then
+    RUNTIME_INSTALL_TYPE="cpa-only"
+    RUNTIME_MANAGER_CONTAINER="$CPAM_CONTAINER"
+  else
+    RUNTIME_INSTALL_TYPE="not-installed"
+    RUNTIME_MANAGER_CONTAINER="$CPAM_CONTAINER"
+  fi
+  if [ -n "$install_dir" ]; then
+    RUNTIME_INSTALL_DIR="$install_dir"
+  else
+    RUNTIME_INSTALL_DIR="$(detect_install_dir)"
+  fi
+}
+
+render_runtime_status_card() {
+  local label="$1"
+  local exists="$2"
+  local state="$3"
+  local image="$4"
+  local port="$5"
+  local internal_port="$6"
+  local legacy="${7:-false}"
   local icon
   local state_text
 
-  if ! container_exists "$name"; then
+  if [ "$exists" != "true" ]; then
     printf '%b  %b%s%b\n' "$ICON_WARN" "$COLOR_YELLOW" "$label" "$COLOR_RESET"
     printf '   状态：%b未安装%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
     return 0
   fi
-
-  image="$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || printf '未知')"
-  state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || printf '未知')"
-  port="$(container_primary_port "$name" "$internal_port")"
-
   case "$state" in
     running) icon="$ICON_OK"; state_text="${COLOR_GREEN}运行中${COLOR_RESET}" ;;
     exited|dead) icon="$ICON_ERROR"; state_text="${COLOR_RED}已停止${COLOR_RESET}" ;;
     *) icon="$ICON_WARN"; state_text="${COLOR_YELLOW}${state}${COLOR_RESET}" ;;
   esac
-
   printf '%b  %b%s%b\n' "$icon" "$COLOR_BOLD" "$label" "$COLOR_RESET"
   printf '   状态：%b\n' "$state_text"
-  printf '   镜像：%s\n' "$image"
+  printf '   镜像：%s\n' "${image:-未知}"
   printf '   端口：%s -> %s/tcp\n' "$port" "$internal_port"
   if [ "$legacy" = "true" ]; then
-    printf '   提示：%b旧版服务，建议执行迁移预检%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
+    printf '   提示：%b旧版服务，建议执行迁移评估%b\n' "$COLOR_YELLOW" "$COLOR_RESET"
+  fi
+}
+
+render_collected_runtime_status() {
+  render_runtime_status_card "CLIProxyAPI" "$RUNTIME_CPA_EXISTS" "$RUNTIME_CPA_STATE" "$RUNTIME_CPA_IMAGE" "$RUNTIME_CPA_PORT" "$CPA_INTERNAL_PORT"
+  printf '\n'
+  if [ "$RUNTIME_PLUS_EXISTS" = "true" ]; then
+    render_runtime_status_card "CPA Manager Plus" "$RUNTIME_PLUS_EXISTS" "$RUNTIME_PLUS_STATE" "$RUNTIME_PLUS_IMAGE" "$RUNTIME_PLUS_PORT" "$CPAM_INTERNAL_PORT"
+  elif [ "$RUNTIME_LEGACY_EXISTS" = "true" ]; then
+    render_runtime_status_card "旧 CPA-Manager" "$RUNTIME_LEGACY_EXISTS" "$RUNTIME_LEGACY_STATE" "$RUNTIME_LEGACY_IMAGE" "$RUNTIME_LEGACY_PORT" "$CPAM_INTERNAL_PORT" true
+  else
+    render_runtime_status_card "CPA Manager Plus" false not-installed "" "未映射" "$CPAM_INTERNAL_PORT"
+  fi
+  if [ "$RUNTIME_PLUS_EXISTS" = "true" ] && [ "$RUNTIME_LEGACY_EXISTS" = "true" ]; then
+    printf '\n'
+    render_runtime_status_card "旧 CPA-Manager" "$RUNTIME_LEGACY_EXISTS" "$RUNTIME_LEGACY_STATE" "$RUNTIME_LEGACY_IMAGE" "$RUNTIME_LEGACY_PORT" "$CPAM_INTERNAL_PORT" true
+    warn "同时检测到新旧 Manager，避免让两者消费同一个用量队列"
   fi
 }
 
@@ -399,20 +464,8 @@ show_menu_status() {
     return 0
   fi
 
-  container_status_card "$CPA_CONTAINER" "CLIProxyAPI" "$CPA_INTERNAL_PORT"
-  printf '\n'
-  if container_exists "$CPAM_CONTAINER"; then
-    container_status_card "$CPAM_CONTAINER" "CPA Manager Plus" "$CPAM_INTERNAL_PORT"
-  elif container_exists "$LEGACY_CPAM_CONTAINER"; then
-    container_status_card "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager" "$CPAM_INTERNAL_PORT" "true"
-  else
-    container_status_card "$CPAM_CONTAINER" "CPA Manager Plus" "$CPAM_INTERNAL_PORT"
-  fi
-  if container_exists "$CPAM_CONTAINER" && container_exists "$LEGACY_CPAM_CONTAINER"; then
-    printf '\n'
-    container_status_card "$LEGACY_CPAM_CONTAINER" "旧 CPA-Manager" "$CPAM_INTERNAL_PORT" "true"
-    warn "同时检测到新旧 Manager，避免让两者消费同一个用量队列"
-  fi
+  collect_runtime_status
+  render_collected_runtime_status
 }
 
 # 将镜像 ID 缩短为便于人工核对的 12 位标识。
@@ -579,7 +632,7 @@ compose_in_dir() {
   (cd "$install_dir" && COMPOSE_IGNORE_ORPHANS=True docker compose "$@")
 }
 
-backup_existing_files() {
+preserve_existing_files() {
   local install_dir="$1"
   local ts
   local file
@@ -588,7 +641,7 @@ backup_existing_files() {
   for file in config.yaml docker-compose.yml; do
     if [ -f "$install_dir/$file" ]; then
       cp -a "$install_dir/$file" "$install_dir/$file.bak.$ts"
-      log "已备份 $install_dir/$file -> $install_dir/$file.bak.$ts"
+      log "已保留原文件副本 $install_dir/$file -> $install_dir/$file.bak.$ts"
     fi
   done
 }
@@ -788,7 +841,7 @@ prepare_install_dir() {
 # 快照、健康检查与迁移校验
 # -----------------------------------------------------------------------------
 
-create_backup_archive() {
+create_snapshot_archive() {
   local install_dir="$1"
   local backup_file="$2"
   shift 2
@@ -803,7 +856,7 @@ create_backup_archive() {
   done
 
   if [ "${#items[@]}" -eq 0 ]; then
-    warn "没有可备份的文件"
+    warn "没有可写入快照归档的文件"
     return 0
   fi
 
@@ -815,7 +868,7 @@ create_backup_archive() {
 }
 
 # 在不中断服务的情况下保存配置、凭证，并使用 SQLite 在线备份 API 生成一致的数据快照。
-create_online_backup_archive() {
+create_online_snapshot_archive() {
   local install_dir="$1"
   local backup_file="$2"
   local python_bin="${PYTHON_BIN:-python3}"
@@ -890,15 +943,15 @@ EOF
     return 1
   fi
   rm -rf "$staging_dir"
-  verify_backup_archive "$backup_file" || {
+  verify_snapshot_archive "$backup_file" || {
     rm -f "$backup_file"
     return 1
   }
   log "快速不停机快照完成: $backup_file"
 }
 
-# Manager 运行时会持续写入 SQLite。备份前短暂停止 Manager，并在任何结果下恢复原运行状态。
-create_consistent_backup_archive() {
+# Manager 运行时会持续写入 SQLite。创建一致性快照前短暂停止 Manager，并在任何结果下恢复原运行状态。
+create_consistent_snapshot_archive() {
   local install_dir="$1"
   local backup_file="$2"
   local scope="$3"
@@ -913,7 +966,7 @@ create_consistent_backup_archive() {
   if container_exists "$manager_container" &&
      [ "$(docker inspect -f '{{.State.Running}}' "$manager_container" 2>/dev/null || true)" = "true" ]; then
     running_containers+=("$manager_container")
-    log "暂停 $manager_container 以创建一致性备份"
+    log "暂停 $manager_container 以创建一致性快照"
     docker stop "$manager_container" >/dev/null || return 1
   fi
 
@@ -929,9 +982,9 @@ create_consistent_backup_archive() {
     running_containers+=("$CPA_CONTAINER")
   fi
 
-  if ! create_backup_archive "$install_dir" "$backup_file" "$@"; then
+  if ! create_snapshot_archive "$install_dir" "$backup_file" "$@"; then
     backup_ok="false"
-  elif ! verify_backup_archive "$backup_file"; then
+  elif ! verify_snapshot_archive "$backup_file"; then
     rm -f "$backup_file"
     backup_ok="false"
   fi
@@ -980,6 +1033,73 @@ human_file_size() {
 
 CREATED_SNAPSHOT_DIR=""
 
+# 所有人工快照、系统保护点和迁移保护点共用同一版元数据与校验字段。
+write_snapshot_metadata() {
+  local snapshot_dir="$1"
+  local snapshot_id="$2"
+  local category="$3"
+  local mode="$4"
+  local remark="$5"
+  local archive_name="$6"
+  local install_dir="$7"
+  local contents="$8"
+  local restore_scope="$9"
+  local archive_file="$snapshot_dir/$archive_name"
+  local size_bytes
+  local checksum_sha256
+  local cpa_host_port
+  local manager_host_port
+
+  [ -s "$archive_file" ] || return 1
+  size_bytes="$(wc -c < "$archive_file" | tr -d ' ')"
+  checksum_sha256="$(sha256sum "$archive_file" | awk '{print $1}')"
+  remark="$(sanitize_snapshot_remark "$remark")"
+  collect_runtime_status "$install_dir"
+  cpa_host_port="$(detect_cpa_port "$install_dir")"
+  manager_host_port="$(detect_cpam_port "$install_dir")"
+  cat > "$snapshot_dir/metadata.env" <<EOF
+format_version=2
+snapshot_id=$snapshot_id
+category=$category
+mode=$mode
+reason=$snapshot_id
+created_at=$(date -Iseconds)
+size_bytes=$size_bytes
+checksum_sha256=$checksum_sha256
+remark=$remark
+script_version=$SCRIPT_VERSION
+install_dir=$install_dir
+cpa_host_port=$cpa_host_port
+manager_host_port=$manager_host_port
+cpa_image=${RUNTIME_CPA_IMAGE:-$CPA_IMAGE}
+cpa_image_id=$RUNTIME_CPA_IMAGE_ID
+manager_image=${RUNTIME_PLUS_IMAGE:-${RUNTIME_LEGACY_IMAGE:-$CPAM_IMAGE}}
+manager_image_id=${RUNTIME_PLUS_IMAGE_ID:-$RUNTIME_LEGACY_IMAGE_ID}
+target_manager_image=$CPAM_IMAGE
+contents=$contents
+restore_scope=$restore_scope
+archive=$archive_name
+EOF
+  chmod 600 "$snapshot_dir/metadata.env" "$archive_file"
+}
+
+append_secondary_snapshot_archive() {
+  local metadata_file="$1"
+  local archive_file="$2"
+  local prefix="$3"
+  local size_bytes
+  local checksum_sha256
+
+  [ -f "$metadata_file" ] && [ -s "$archive_file" ] || return 1
+  size_bytes="$(wc -c < "$archive_file" | tr -d ' ')"
+  checksum_sha256="$(sha256sum "$archive_file" | awk '{print $1}')"
+  cat >> "$metadata_file" <<EOF
+${prefix}_archive=$(basename "$archive_file")
+${prefix}_size_bytes=$size_bytes
+${prefix}_checksum_sha256=$checksum_sha256
+EOF
+}
+
 # 创建带独立目录和元数据的标准快照，供人工、安装、升级和恢复保护共同复用。
 create_snapshot_record() {
   local install_dir="$1"
@@ -992,8 +1112,6 @@ create_snapshot_record() {
   local final_dir
   local temp_dir
   local archive_file
-  local size_bytes
-  local checksum_sha256
   local suffix=0
 
   case "$category" in
@@ -1019,35 +1137,23 @@ create_snapshot_record() {
   archive_file="$temp_dir/snapshot.tar.gz"
 
   if [ "$mode" = "online" ]; then
-    if ! create_online_backup_archive "$install_dir" "$archive_file"; then
+    if ! create_online_snapshot_archive "$install_dir" "$archive_file"; then
       rm -rf "$temp_dir"
       return 1
     fi
   else
-    if ! create_consistent_backup_archive "$install_dir" "$archive_file" all \
+    if ! create_consistent_snapshot_archive "$install_dir" "$archive_file" all \
       docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data; then
       rm -rf "$temp_dir"
       return 1
     fi
   fi
 
-  size_bytes="$(wc -c < "$archive_file" | tr -d ' ')"
-  checksum_sha256="$(sha256sum "$archive_file" | awk '{print $1}')"
-  remark="$(sanitize_snapshot_remark "$remark")"
-  cat > "$temp_dir/metadata.env" <<EOF
-format_version=1
-snapshot_id=$(basename "$final_dir")
-category=$category
-mode=$mode
-created_at=$(date -Iseconds)
-size_bytes=$size_bytes
-checksum_sha256=$checksum_sha256
-remark=$remark
-cpa_image=$CPA_IMAGE
-manager_image=$CPAM_IMAGE
-archive=snapshot.tar.gz
-EOF
-  chmod 600 "$temp_dir/metadata.env" "$archive_file"
+  write_snapshot_metadata "$temp_dir" "$(basename "$final_dir")" "$category" "$mode" "$remark" \
+    snapshot.tar.gz "$install_dir" "compose,config,secrets,auths,manager-data" "managed-deployment" || {
+    rm -rf "$temp_dir"
+    return 1
+  }
   mv "$temp_dir" "$final_dir"
   CREATED_SNAPSHOT_DIR="$final_dir"
   log "快照已保存: $final_dir"
@@ -1136,6 +1242,222 @@ list_snapshots() {
   collect_and_print_snapshots "$install_dir"
 }
 
+is_managed_snapshot_dir() {
+  local install_dir="$1"
+  local snapshot_dir="$2"
+  local root
+  local resolved_root
+  local resolved_dir
+
+  root="$(snapshot_root_dir "$install_dir")"
+  resolved_root="$(readlink -f "$root" 2>/dev/null || true)"
+  resolved_dir="$(readlink -f "$snapshot_dir" 2>/dev/null || true)"
+  [ -n "$resolved_root" ] && [ -n "$resolved_dir" ] || return 1
+  [ ! -L "$snapshot_dir" ] || return 1
+  case "$resolved_dir" in
+    "$resolved_root/manual/"*|"$resolved_root/system/"*) ;;
+    *) return 1 ;;
+  esac
+  [ -f "$resolved_dir/metadata.env" ] && [ -f "$resolved_dir/snapshot.tar.gz" ]
+}
+
+snapshot_can_be_deleted() {
+  local category="$1"
+  local snapshot_id="$2"
+
+  if [ "$category" = "manual" ]; then
+    return 0
+  fi
+  if [ "$category" = "system" ] && [[ "$snapshot_id" == scheduled-* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+delete_snapshot() {
+  local install_dir
+  local selection
+  local snapshot_dir
+  local metadata_file
+  local snapshot_id
+  local category
+  local created_at
+  local remark
+  local display_size
+
+  install_dir="$(detect_install_dir)"
+  collect_and_print_snapshots "$install_dir"
+  [ "${#SNAPSHOT_DIRS[@]}" -gt 0 ] || return 0
+  selection="$(read_with_default "请输入要删除的快照编号，回车取消: " "")"
+  [ -n "$selection" ] || { log "已取消删除"; return 0; }
+  [[ "$selection" =~ ^[0-9]+$ ]] || die "快照编号必须是数字"
+  (( selection >= 1 && selection <= ${#SNAPSHOT_DIRS[@]} )) || die "快照编号超出范围"
+
+  snapshot_dir="${SNAPSHOT_DIRS[$((selection - 1))]}"
+  is_managed_snapshot_dir "$install_dir" "$snapshot_dir" || die "目标不是受管快照目录，拒绝删除: $snapshot_dir"
+  metadata_file="$snapshot_dir/metadata.env"
+  snapshot_id="$(snapshot_metadata_value "$metadata_file" snapshot_id)"
+  category="$(snapshot_metadata_value "$metadata_file" category)"
+  created_at="$(snapshot_metadata_value "$metadata_file" created_at)"
+  remark="$(snapshot_metadata_value "$metadata_file" remark)"
+  snapshot_can_be_deleted "$category" "$snapshot_id" || die "该快照是系统保护点，不能通过普通删除入口删除: $snapshot_id"
+  display_size="$(human_file_size "$(snapshot_metadata_value "$metadata_file" size_bytes)")"
+
+  print_section "删除快照确认"
+  printf '快照 ID：%s\n' "$snapshot_id"
+  printf '类型：%s\n' "$category"
+  printf '创建时间：%s\n' "$created_at"
+  printf '大小：%s\n' "$display_size"
+  printf '备注：%s\n' "${remark:-（无备注）}"
+  printf '影响：只删除该快照目录，不影响当前部署、其他快照或原始日志。\n'
+  if ! ask_yes_no "确认永久删除这个快照" "N"; then
+    log "已取消删除"
+    return 0
+  fi
+  rm -rf "${snapshot_dir:?}"
+  log "已删除快照: $snapshot_id"
+}
+
+# 滚动清理只处理 scheduled-*，系统初始点、升级前和恢复前保护点永远不自动删除。
+prune_scheduled_snapshots() {
+  local install_dir="$1"
+  local keep_count="$2"
+  local system_dir
+  local metadata_file
+  local snapshot_dir
+  local index=0
+
+  [[ "$keep_count" =~ ^[0-9]+$ ]] && (( keep_count >= 1 )) || return 1
+  system_dir="$(snapshot_root_dir "$install_dir")/system"
+  while IFS= read -r metadata_file; do
+    index=$((index + 1))
+    (( index <= keep_count )) && continue
+    snapshot_dir="$(dirname "$metadata_file")"
+    is_managed_snapshot_dir "$install_dir" "$snapshot_dir" || {
+      warn "跳过非受管定时快照目录: $snapshot_dir"
+      continue
+    }
+    rm -rf "${snapshot_dir:?}"
+    log "滚动删除旧定时快照: $(basename "$snapshot_dir")"
+  done < <(find "$system_dir" -mindepth 2 -maxdepth 2 -type f -name metadata.env -path '*/scheduled-*/metadata.env' \
+    -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+}
+
+run_scheduled_snapshot() {
+  local install_dir
+  local schedule_file
+  local keep_count="10"
+
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  mkdir -p "$install_dir/state"
+  chmod 700 "$install_dir/state"
+  schedule_file="$install_dir/state/snapshot-schedule.env"
+  if [ -f "$schedule_file" ]; then
+    keep_count="$(awk -F= '$1 == "KEEP_COUNT" { print $2; exit }' "$schedule_file")"
+  fi
+  [[ "$keep_count" =~ ^[0-9]+$ ]] && (( keep_count >= 1 )) || keep_count="10"
+
+  exec 9> "$install_dir/state/snapshot.lock"
+  if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    warn "已有快照任务正在运行，本次定时任务跳过"
+    return 0
+  fi
+  create_snapshot_record "$install_dir" system scheduled "自动定时快照" online || return 1
+  prune_scheduled_snapshots "$install_dir" "$keep_count"
+}
+
+configure_snapshot_schedule() {
+  local install_dir
+  local frequency
+  local on_calendar
+  local keep_count
+  local managed_script
+  local source_script="${BASH_SOURCE[0]}"
+  local service_file="/etc/systemd/system/cpa-cpam-snapshot.service"
+  local timer_file="/etc/systemd/system/cpa-cpam-snapshot.timer"
+
+  has_systemd || die "当前系统没有可用 systemd，无法配置定时快照"
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  [[ "$install_dir" != *$'\n'* && "$install_dir" != *$'\r'* && ! "$install_dir" =~ [\"%] ]] || die "安装目录包含不适合 systemd 单元的字符"
+  print_section "定时快照设置"
+  printf '1) 每天 03:00 创建\n'
+  printf '2) 每周日 03:00 创建\n'
+  frequency="$(read_with_default "请选择执行频率 [1]: " "1")"
+  case "$frequency" in
+    1) on_calendar="*-*-* 03:00:00" ;;
+    2) on_calendar="Sun *-*-* 03:00:00" ;;
+    *) die "无效执行频率: $frequency" ;;
+  esac
+  keep_count="$(read_with_default "保留最近多少个自动定时快照 [10]: " "10")"
+  if [[ ! "$keep_count" =~ ^[0-9]+$ ]] || (( keep_count < 1 || keep_count > 100 )); then
+    die "保留数量必须是 1-100"
+  fi
+
+  print_section "启用定时快照确认"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '执行计划：%s\n' "$on_calendar"
+  printf '快照模式：快速不停机\n'
+  printf '滚动策略：只保留最近 %s 个 scheduled-* 快照\n' "$keep_count"
+  printf '不会自动删除：人工快照、初始安装、升级前、密钥重置前、恢复前和迁移快照。\n'
+  if ! ask_yes_no "确认写入并启用 systemd timer" "N"; then
+    log "已取消定时快照设置"
+    return 0
+  fi
+
+  mkdir -p "$install_dir/bin" "$install_dir/state"
+  chmod 700 "$install_dir/bin" "$install_dir/state"
+  managed_script="$install_dir/bin/cpa-cpam-manager.sh"
+  cp "$source_script" "$managed_script" || die "无法安装定时任务脚本副本"
+  chmod 700 "$managed_script"
+  cat > "$install_dir/state/snapshot-schedule.env" <<EOF
+KEEP_COUNT=$keep_count
+ON_CALENDAR=$on_calendar
+EOF
+  chmod 600 "$install_dir/state/snapshot-schedule.env"
+  cat > "$service_file" <<EOF
+[Unit]
+Description=CPA Manager Plus automatic snapshot
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment="INSTALL_DIR=$install_dir"
+ExecStart=/bin/bash "$managed_script" scheduled-snapshot
+EOF
+  cat > "$timer_file" <<EOF
+[Unit]
+Description=CPA Manager Plus automatic snapshot timer
+
+[Timer]
+OnCalendar=$on_calendar
+Persistent=true
+RandomizedDelaySec=300
+Unit=cpa-cpam-snapshot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cpa-cpam-snapshot.timer
+  log "定时快照已启用"
+  systemctl list-timers cpa-cpam-snapshot.timer --no-pager || true
+}
+
+remove_snapshot_schedule() {
+  local service_file="/etc/systemd/system/cpa-cpam-snapshot.service"
+  local timer_file="/etc/systemd/system/cpa-cpam-snapshot.timer"
+
+  if has_systemd && { [ -f "$service_file" ] || [ -f "$timer_file" ]; }; then
+    systemctl disable --now cpa-cpam-snapshot.timer >/dev/null 2>&1 || true
+    rm -f "$service_file" "$timer_file"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log "已移除定时快照 systemd timer"
+  fi
+}
+
 create_snapshot() {
   local install_dir
   local mode_choice
@@ -1174,7 +1496,7 @@ verify_restorable_snapshot() {
   local expected_checksum="${2:-}"
   local actual_checksum
   local entry
-  verify_backup_archive "$archive_file" || return 1
+  verify_snapshot_archive "$archive_file" || return 1
   if [ -n "$expected_checksum" ]; then
     actual_checksum="$(sha256sum "$archive_file" | awk '{print $1}')"
     [ "$actual_checksum" = "$expected_checksum" ] || return 1
@@ -1389,7 +1711,7 @@ upsert_secrets_value() {
   mv -f "$temp_file" "$secrets_file"
 }
 
-verify_backup_archive() {
+verify_snapshot_archive() {
   local backup_file="$1"
   [ -s "$backup_file" ] || return 1
   tar -tzf "$backup_file" >/dev/null 2>&1
@@ -1487,7 +1809,7 @@ install_cpa_cpam() {
   install_type="$(detect_install_type)"
   case "$install_type" in
     legacy)
-      die "检测到旧 CPA-Manager。为保护历史数据，请先运行 migrate --dry-run 或使用菜单 12；当前版本不会通过 install 绕过迁移流程"
+      die "检测到旧 CPA-Manager。为保护历史数据，请先运行 migration-assess 或使用菜单 17；当前版本不会通过 install 绕过迁移流程"
       ;;
     mixed)
       die "同时检测到新旧 Manager。请先确认唯一用量队列消费者，禁止安装/重装"
@@ -1531,7 +1853,7 @@ install_cpa_cpam() {
   if [ -d "$install_dir" ] && { [ -f "$install_dir/config.yaml" ] || [ -f "$install_dir/docker-compose.yml" ]; }; then
     print_section "重装确认"
     printf '安装目录：%s\n' "$install_dir"
-    printf '影响：现有 Compose 和 config.yaml 会先备份再覆盖，数据目录保留。\n'
+    printf '影响：现有 Compose 和 config.yaml 会先保留副本再覆盖，数据目录保留。\n'
     if ! ask_yes_no "确认继续安装/重装" "N"; then
       die "已取消安装/重装"
     fi
@@ -1543,7 +1865,7 @@ install_cpa_cpam() {
   printf 'Manager 端口：%s\n' "$cpam_host_port"
   printf 'CPA 镜像：%s\n' "$CPA_IMAGE"
   printf 'Manager 镜像：%s\n' "$CPAM_IMAGE"
-  printf '数据策略：配置文件会备份后写入，auths、logs 和 cpa-manager-data 持久化。\n'
+  printf '数据策略：配置文件会保留副本后写入，auths、logs 和 cpa-manager-data 持久化。\n'
   if ! ask_yes_no "已核对安装信息，确认继续" "N"; then
     log "已取消安装"
     return 0
@@ -1551,7 +1873,7 @@ install_cpa_cpam() {
 
   pre_install_cleanup
   prepare_install_dir "$install_dir"
-  backup_existing_files "$install_dir"
+  preserve_existing_files "$install_dir"
   write_config_yaml "$install_dir" "$api_key" "$mgt_key"
   write_compose_yaml "$install_dir" "$cpa_host_port" "$cpam_host_port" "$cpamp_admin_key"
   server_ip="$(get_server_ip)"
@@ -1587,25 +1909,26 @@ upgrade_cpa_cpam() {
   local cpa_changed="false"
   local manager_changed="false"
 
-  install_type="$(detect_install_type)"
+  collect_runtime_status
+  install_type="$RUNTIME_INSTALL_TYPE"
   case "$install_type" in
     legacy) die "检测到旧 CPA-Manager，请使用 migrate 升级到 Plus" ;;
     mixed) die "同时检测到新旧 Manager，禁止升级，请先确认唯一消费者" ;;
   esac
 
-  detected_dir="$(detect_install_dir)"
+  detected_dir="$RUNTIME_INSTALL_DIR"
   print_section "升级检查"
   printf '安装目录：%s\n' "$detected_dir"
   install_dir="$(read_with_default "如需修改安装目录请输入新路径，直接回车继续: " "$detected_dir")"
   ensure_compose_dir "$install_dir"
 
-  container_exists "$CPA_CONTAINER" || die "未检测到 $CPA_CONTAINER，无法执行升级"
-  container_exists "$CPAM_CONTAINER" || die "未检测到 $CPAM_CONTAINER，无法执行升级"
+  [ "$RUNTIME_CPA_EXISTS" = "true" ] || die "未检测到 $CPA_CONTAINER，无法执行升级"
+  [ "$RUNTIME_PLUS_EXISTS" = "true" ] || die "未检测到 $CPAM_CONTAINER，无法执行升级"
 
-  cpa_target_ref="$(docker inspect -f '{{.Config.Image}}' "$CPA_CONTAINER" 2>/dev/null || true)"
-  manager_target_ref="$(docker inspect -f '{{.Config.Image}}' "$CPAM_CONTAINER" 2>/dev/null || true)"
-  cpa_current_id="$(container_image_id "$CPA_CONTAINER")"
-  manager_current_id="$(container_image_id "$CPAM_CONTAINER")"
+  cpa_target_ref="$RUNTIME_CPA_IMAGE"
+  manager_target_ref="$RUNTIME_PLUS_IMAGE"
+  cpa_current_id="$RUNTIME_CPA_IMAGE_ID"
+  manager_current_id="$RUNTIME_PLUS_IMAGE_ID"
   if [ -z "$cpa_target_ref" ] || [ -z "$manager_target_ref" ]; then
     die "无法读取当前容器镜像配置"
   fi
@@ -1707,18 +2030,195 @@ status_cpa_cpam() {
   local cpa_host_port
   local cpam_host_port
 
-  install_dir="$(detect_install_dir)"
+  collect_runtime_status
+  install_dir="$RUNTIME_INSTALL_DIR"
   cpa_host_port="$(detect_cpa_port "$install_dir")"
   cpam_host_port="$(detect_cpam_port "$install_dir")"
 
   print_section "部署信息"
   printf '安装目录：%s\n' "$install_dir"
-  printf '安装类型：%s\n' "$(detect_install_type)"
+  printf '安装类型：%s\n' "$RUNTIME_INSTALL_TYPE"
   printf 'CPA 端口：%s\n' "$cpa_host_port"
   printf 'Manager 端口：%s\n' "$cpam_host_port"
-  show_menu_status
+  print_section "服务状态"
+  render_collected_runtime_status
   print_section "健康检查"
   health_check "$install_dir" "" "$cpa_host_port" "$cpam_host_port"
+}
+
+DOCTOR_ERRORS=0
+DOCTOR_WARNINGS=0
+
+doctor_result() {
+  local level="$1"
+  shift
+  case "$level" in
+    ok) printf '%b  %s\n' "$ICON_OK" "$*" ;;
+    warn) DOCTOR_WARNINGS=$((DOCTOR_WARNINGS + 1)); printf '%b  %s\n' "$ICON_WARN" "$*" ;;
+    error) DOCTOR_ERRORS=$((DOCTOR_ERRORS + 1)); printf '%b  %s\n' "$ICON_ERROR" "$*" ;;
+  esac
+}
+
+# 配置体检保持只读：只解析、检查和报告，不自动覆盖配置或修改权限。
+configuration_doctor() {
+  local install_dir
+  local cpa_port
+  local manager_port
+  local manager_mount
+  local expected_mount
+  local mode
+  local sqlite_file
+  local python_bin="${PYTHON_BIN:-python3}"
+  local free_kb
+
+  DOCTOR_ERRORS=0
+  DOCTOR_WARNINGS=0
+  collect_runtime_status
+  install_dir="$RUNTIME_INSTALL_DIR"
+  print_section "配置体检（只读）"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '安装类型：%s\n' "$RUNTIME_INSTALL_TYPE"
+
+  case "$RUNTIME_INSTALL_TYPE" in
+    mixed) doctor_result error "同时存在新旧 Manager，可能重复消费用量队列" ;;
+    not-installed|cpa-only) doctor_result warn "部署不完整: $RUNTIME_INSTALL_TYPE" ;;
+    *) doctor_result ok "安装类型可识别: $RUNTIME_INSTALL_TYPE" ;;
+  esac
+
+  if [ -f "$install_dir/docker-compose.yml" ]; then
+    if compose_in_dir "$install_dir" config >/dev/null 2>&1; then
+      doctor_result ok "docker-compose.yml 解析通过"
+    else
+      doctor_result error "docker-compose.yml 无法通过 docker compose config"
+    fi
+  else
+    doctor_result error "缺少 docker-compose.yml"
+  fi
+
+  if [ -f "$install_dir/config.yaml" ]; then
+    if grep -Eq '^[[:space:]]*remote-management:' "$install_dir/config.yaml"; then
+      doctor_result ok "存在远程管理配置"
+    else
+      doctor_result error "缺少 remote-management 配置"
+    fi
+    if grep -Eq '^[[:space:]]*allow-remote:[[:space:]]*true' "$install_dir/config.yaml"; then
+      doctor_result ok "远程管理访问已启用"
+    else
+      doctor_result warn "未确认启用 remote-management.allow-remote"
+    fi
+    if grep -Eq '^[[:space:]]*usage-statistics-enabled:[[:space:]]*true' "$install_dir/config.yaml"; then
+      doctor_result ok "用量统计已启用"
+    else
+      doctor_result warn "未确认启用 usage-statistics-enabled"
+    fi
+  else
+    doctor_result error "缺少 config.yaml"
+  fi
+
+  cpa_port="$(detect_cpa_port "$install_dir")"
+  manager_port="$(detect_cpam_port "$install_dir")"
+  if validate_port "$cpa_port" && validate_port "$manager_port"; then
+    if [ "$cpa_port" = "$manager_port" ]; then
+      doctor_result error "CPA 与 Manager 使用相同宿主机端口: $cpa_port"
+    else
+      doctor_result ok "端口配置有效: CPA=$cpa_port, Manager=$manager_port"
+    fi
+  else
+    doctor_result error "检测到无效端口: CPA=$cpa_port, Manager=$manager_port"
+  fi
+
+  if [ -f "$install_dir/.secrets.txt" ]; then
+    mode="$(stat -c '%a' "$install_dir/.secrets.txt" 2>/dev/null || true)"
+    if [ "$mode" = "600" ]; then
+      doctor_result ok ".secrets.txt 权限为 600"
+    else
+      doctor_result warn ".secrets.txt 权限应为 600，当前为 ${mode:-未知}"
+    fi
+  else
+    doctor_result error "缺少 .secrets.txt，部分明文管理密钥可能无法恢复"
+  fi
+
+  if [ -d "$install_dir/auths" ] && [ -w "$install_dir/auths" ]; then
+    doctor_result ok "认证目录存在且可写"
+  else
+    doctor_result error "auths 认证目录不存在或不可写"
+  fi
+
+  if [ -f "$install_dir/cpa-manager-data/data.key" ]; then
+    mode="$(stat -c '%a' "$install_dir/cpa-manager-data/data.key" 2>/dev/null || true)"
+    case "$mode" in
+      600|400) doctor_result ok "data.key 存在且权限受限" ;;
+      *) doctor_result warn "data.key 权限过宽或未知: ${mode:-未知}" ;;
+    esac
+  else
+    doctor_result error "缺少 cpa-manager-data/data.key，Plus 加密数据可能无法恢复"
+  fi
+
+  sqlite_file="$install_dir/cpa-manager-data/usage.sqlite"
+  if [ -s "$sqlite_file" ]; then
+    if "$python_bin" - "$sqlite_file" <<'PY' >/dev/null 2>&1
+import sqlite3
+import sys
+
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=10)
+try:
+    result = db.execute("PRAGMA quick_check").fetchone()
+    if not result or result[0] != "ok":
+        raise SystemExit(1)
+finally:
+    db.close()
+PY
+    then
+      doctor_result ok "Manager SQLite quick_check 通过"
+    else
+      doctor_result error "Manager SQLite quick_check 失败或 Python 不可用"
+    fi
+  else
+    doctor_result warn "未找到可检查的 usage.sqlite"
+  fi
+
+  if [ "$RUNTIME_PLUS_EXISTS" = "true" ] || [ "$RUNTIME_LEGACY_EXISTS" = "true" ]; then
+    manager_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$RUNTIME_MANAGER_CONTAINER" 2>/dev/null || true)"
+    expected_mount="$(readlink -f "$install_dir/cpa-manager-data" 2>/dev/null || printf '%s' "$install_dir/cpa-manager-data")"
+    manager_mount="$(readlink -f "$manager_mount" 2>/dev/null || printf '%s' "$manager_mount")"
+    if [ "$manager_mount" = "$expected_mount" ]; then
+      doctor_result ok "Manager /data 挂载指向受管数据目录"
+    else
+      doctor_result error "Manager /data 挂载异常: ${manager_mount:-未检测到}"
+    fi
+  fi
+
+  if [ -d "$install_dir/snapshots" ]; then
+    mode="$(stat -c '%a' "$install_dir/snapshots" 2>/dev/null || true)"
+    if [ "$mode" = "700" ]; then
+      doctor_result ok "快照根目录权限为 700"
+    else
+      doctor_result warn "快照根目录权限应为 700，当前为 ${mode:-未知}"
+    fi
+  else
+    doctor_result warn "尚未创建快照目录"
+  fi
+
+  free_kb="$(df -Pk "$install_dir" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  if [[ "$free_kb" =~ ^[0-9]+$ ]]; then
+    if (( free_kb < 262144 )); then
+      doctor_result error "磁盘剩余空间低于 256 MiB"
+    elif (( free_kb < 1048576 )); then
+      doctor_result warn "磁盘剩余空间低于 1 GiB"
+    else
+      doctor_result ok "磁盘剩余空间: $(human_file_size "$((free_kb * 1024))")"
+    fi
+  else
+    doctor_result warn "无法读取磁盘剩余空间"
+  fi
+
+  print_section "体检结论"
+  printf '错误：%s 项    警告：%s 项\n' "$DOCTOR_ERRORS" "$DOCTOR_WARNINGS"
+  if [ "$DOCTOR_ERRORS" -gt 0 ]; then
+    printf '%b  配置体检未通过，请先处理错误项。\n' "$ICON_ERROR"
+    return 1
+  fi
+  printf '%b  配置体检通过；警告项建议人工确认。\n' "$ICON_OK"
 }
 
 logs_cpa_cpam() {
@@ -2061,6 +2561,7 @@ uninstall_cpa_cpam() {
     return 0
   fi
 
+  remove_snapshot_schedule
   if [ -f "$install_dir/docker-compose.yml" ]; then
     compose_in_dir "$install_dir" down || warn "docker compose down 失败，请手动检查"
   else
@@ -2313,7 +2814,31 @@ print_access_ip_ranking() {
   fi
 }
 
-# 仅把两张榜单前 30 名中的公网 IP 发给 IP-API；内网和回环地址只在本地标记。
+# 消费与管理审计只复用公网 IP 清单生成和 Batch 查询代码，输入报告始终相互隔离。
+collect_ranked_public_ips() {
+  local success_report="$1"
+  local failure_report="$2"
+  local public_ips="$3"
+
+  {
+    head -n 30 "$success_report"
+    head -n 30 "$failure_report"
+  } | awk -F '\t' '$3 == "public" { print $2 }' | sort -u | head -n 100 > "$public_ips"
+}
+
+build_ip_api_batch_request() {
+  local public_ips="$1"
+  local request_file="$2"
+
+  jq -R -s '
+    split("\n")
+    | map(select(length > 0) | {
+        query: .,
+        fields: "status,message,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,query"
+      })' "$public_ips" > "$request_file"
+}
+
+# 仅把当前审计两张榜单前 30 名中的公网 IP 发给 IP-API；内网和回环地址只在本地标记。
 query_ranked_ip_geolocation() {
   local success_report="$1"
   local failure_report="$2"
@@ -2325,10 +2850,7 @@ query_ranked_ip_geolocation() {
   local request_url
 
   : > "$geo_report"
-  {
-    head -n 30 "$success_report"
-    head -n 30 "$failure_report"
-  } | awk -F '\t' '$3 == "public" { print $2 }' | sort -u | head -n 100 > "$public_ips"
+  collect_ranked_public_ips "$success_report" "$failure_report" "$public_ips"
 
   if [ ! -s "$public_ips" ]; then
     log "排行榜中没有需要查询归属的公网 IP"
@@ -2343,12 +2865,10 @@ query_ranked_ip_geolocation() {
     return 0
   fi
 
-  jq -R -s '
-    split("\n")
-    | map(select(length > 0) | {
-        query: .,
-        fields: "status,message,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,query"
-      })' "$public_ips" > "$request_file"
+  build_ip_api_batch_request "$public_ips" "$request_file" || {
+    warn "无法生成 IP-API Batch 请求，继续显示本地排行榜"
+    return 1
+  }
 
   if [[ "$IP_API_BATCH_URL" == *\?* ]]; then
     request_url="${IP_API_BATCH_URL}&lang=zh-CN"
@@ -2507,13 +3027,9 @@ management_audit() {
 # -----------------------------------------------------------------------------
 
 preflight_cpa_cpam() {
-  local install_type
-  local install_dir
-  local manager_container
   local data_source
-  local image
 
-  print_section "迁移预检（只读）"
+  print_section "迁移条件检查"
   if ! command -v docker >/dev/null 2>&1; then
     printf 'Docker: 未安装\n安装类型: not-installed\n'
     return 1
@@ -2523,41 +3039,39 @@ preflight_cpa_cpam() {
     return 1
   fi
 
-  install_type="$(detect_install_type)"
-  install_dir="$(detect_install_dir)"
-  manager_container="$(active_cpam_container)"
-  printf '安装类型：%b%s%b\n' "$COLOR_BOLD" "$install_type" "$COLOR_RESET"
-  printf '安装目录：%s\n' "$install_dir"
-  show_menu_status
+  collect_runtime_status
+  printf '安装类型：%b%s%b\n' "$COLOR_BOLD" "$RUNTIME_INSTALL_TYPE" "$COLOR_RESET"
+  printf '安装目录：%s\n' "$RUNTIME_INSTALL_DIR"
+  print_section "服务状态"
+  render_collected_runtime_status
 
-  if container_exists "$manager_container"; then
-    image="$(docker inspect -f '{{.Config.Image}}' "$manager_container" 2>/dev/null || true)"
-    data_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$manager_container" 2>/dev/null || true)"
+  if [ "$RUNTIME_PLUS_EXISTS" = "true" ] || [ "$RUNTIME_LEGACY_EXISTS" = "true" ]; then
+    data_source="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$RUNTIME_MANAGER_CONTAINER" 2>/dev/null || true)"
     print_section "迁移数据"
-    printf 'Manager 容器：%s\n' "$manager_container"
-    printf 'Manager 镜像：%s\n' "${image:-未知}"
+    printf 'Manager 容器：%s\n' "$RUNTIME_MANAGER_CONTAINER"
+    printf 'Manager 镜像：%s\n' "${RUNTIME_PLUS_IMAGE:-${RUNTIME_LEGACY_IMAGE:-未知}}"
     printf '/data 来源：%s\n' "${data_source:-未检测到}"
   fi
 
-  if [ -f "$install_dir/config.yaml" ]; then
-    if grep -Eq '^[[:space:]]*usage-statistics-enabled:[[:space:]]*true' "$install_dir/config.yaml"; then
+  if [ -f "$RUNTIME_INSTALL_DIR/config.yaml" ]; then
+    if grep -Eq '^[[:space:]]*usage-statistics-enabled:[[:space:]]*true' "$RUNTIME_INSTALL_DIR/config.yaml"; then
       printf '%b  用量统计已启用\n' "$ICON_OK"
     else
       warn "config.yaml 未确认启用 usage-statistics-enabled"
     fi
-    if grep -Eq '^[[:space:]]*allow-remote:[[:space:]]*true' "$install_dir/config.yaml"; then
+    if grep -Eq '^[[:space:]]*allow-remote:[[:space:]]*true' "$RUNTIME_INSTALL_DIR/config.yaml"; then
       printf '%b  远程管理已启用\n' "$ICON_OK"
     else
       warn "config.yaml 未确认启用 remote-management.allow-remote"
     fi
   else
-    warn "未找到 $install_dir/config.yaml"
+    warn "未找到 $RUNTIME_INSTALL_DIR/config.yaml"
   fi
 
-  case "$install_type" in
+  case "$RUNTIME_INSTALL_TYPE" in
     legacy)
       print_section "预检结论"
-      printf '%b  可进入迁移准备。正式迁移会停止旧 Manager 并创建一致性备份。\n' "$ICON_OK"
+      printf '%b  可进入迁移准备。正式迁移会停止旧 Manager 并创建一致性快照。\n' "$ICON_OK"
       ;;
     plus)
       print_section "预检结论"
@@ -2574,12 +3088,11 @@ preflight_cpa_cpam() {
   esac
 }
 
-migrate_dry_run() {
-  local install_type
-  install_type="$(detect_install_type)"
+migration_assess() {
+  print_section "迁移评估（只读）"
   preflight_cpa_cpam || return 1
 
-  if [ "$install_type" != "legacy" ]; then
+  if [ "$RUNTIME_INSTALL_TYPE" != "legacy" ]; then
     return 0
   fi
 
@@ -2588,7 +3101,7 @@ migrate_dry_run() {
 迁移计划（未执行任何写操作）:
 1. 记录旧容器、镜像、端口、挂载和 Compose 状态
 2. 仅停止旧 cpa-manager，保持 cli-proxy-api 运行
-3. 备份完整 cpa-manager-data、Compose 和密钥文件并校验
+3. 创建包含完整 cpa-manager-data、Compose 和密钥文件的快照并校验
 4. 保持 18317 外部端口和原 /data 挂载不变
 5. 切换为 seakee/cpa-manager-plus 并生成独立 CPAMP_ADMIN_KEY
 6. 验证 /health、/usage-service/info、鉴权 /status 和 data.key
@@ -2601,11 +3114,18 @@ rollback_from_snapshot() {
   local install_dir="$1"
   local snapshot_dir="$2"
   local backup_file="$snapshot_dir/pre-migration.tar.gz"
+  local metadata_file="$snapshot_dir/metadata.env"
+  local expected_checksum
   local failed_dir
   failed_dir="$install_dir/cpa-manager-data.failed-$(timestamp)"
 
   [ -d "$snapshot_dir" ] || die "迁移快照不存在: $snapshot_dir"
-  verify_backup_archive "$backup_file" || die "迁移快照损坏或不可读: $backup_file"
+  if [ -f "$metadata_file" ]; then
+    expected_checksum="$(snapshot_metadata_value "$metadata_file" checksum_sha256)"
+    verify_restorable_snapshot "$backup_file" "$expected_checksum" || die "迁移快照校验失败或包含不安全路径: $backup_file"
+  else
+    verify_snapshot_archive "$backup_file" || die "旧格式迁移快照损坏或不可读: $backup_file"
+  fi
 
   if container_exists "$CPAM_CONTAINER"; then
     docker rm -f "$CPAM_CONTAINER" >/dev/null || warn "删除 Plus 容器失败，请手动检查"
@@ -2650,15 +3170,15 @@ migrate_cpa_cpam() {
   local temp_compose
   local current_cpa_image
 
-  preflight_cpa_cpam || die "迁移预检未通过"
-  install_type="$(detect_install_type)"
+  migration_assess || die "迁移评估未通过"
+  install_type="$RUNTIME_INSTALL_TYPE"
   [ "$install_type" = "legacy" ] || die "当前安装类型不是 legacy，无需或无法迁移"
-  install_dir="$(detect_install_dir)"
+  install_dir="$RUNTIME_INSTALL_DIR"
   ensure_compose_dir "$install_dir"
   standard_manager_data_source "$install_dir" >/dev/null || die "当前 /data 不是标准 $install_dir/cpa-manager-data bind mount；为避免数据损坏，自动迁移已阻断"
   cpa_host_port="$(detect_cpa_port "$install_dir")"
   cpam_host_port="$(detect_cpam_port "$install_dir")"
-  current_cpa_image="$(docker inspect -f '{{.Config.Image}}' "$CPA_CONTAINER" 2>/dev/null || true)"
+  current_cpa_image="$RUNTIME_CPA_IMAGE"
   [ -n "$current_cpa_image" ] && CPA_IMAGE="$current_cpa_image"
   cpamp_admin_key="${CPAMP_ADMIN_KEY:-$(generate_cpamp_admin_key)}"
 
@@ -2671,30 +3191,29 @@ migrate_cpa_cpam() {
   backup_file="$snapshot_dir/pre-migration.tar.gz"
   temp_compose="$install_dir/docker-compose.yml.cpamp.tmp"
   mkdir -p "$snapshot_dir"
+  chmod 700 "$install_dir/snapshots" "$install_dir/snapshots/migration" "$snapshot_dir"
 
   write_compose_yaml "$install_dir" "$cpa_host_port" "$cpam_host_port" "$cpamp_admin_key" "$temp_compose"
   compose_in_dir "$install_dir" -f "$temp_compose" config >/dev/null || die "Plus Compose 校验失败，未停止旧 Manager"
 
-  log "停止旧 CPA-Manager 以创建一致性 SQLite 备份"
+  log "停止旧 CPA-Manager 以创建一致性 SQLite 快照"
   docker stop "$LEGACY_CPAM_CONTAINER" >/dev/null || die "停止旧 CPA-Manager 失败"
-  if ! create_backup_archive "$install_dir" "$backup_file" docker-compose.yml .secrets.txt cpa-manager-data; then
+  if ! create_snapshot_archive "$install_dir" "$backup_file" docker-compose.yml .secrets.txt cpa-manager-data; then
     docker start "$LEGACY_CPAM_CONTAINER" >/dev/null || true
-    die "迁移前备份失败，旧 Manager 已尝试恢复"
+    die "迁移前快照失败，旧 Manager 已尝试恢复"
   fi
-  if ! verify_backup_archive "$backup_file"; then
+  if ! verify_snapshot_archive "$backup_file"; then
     docker start "$LEGACY_CPAM_CONTAINER" >/dev/null || true
-    die "迁移备份校验失败，旧 Manager 已尝试恢复"
+    die "迁移快照校验失败，旧 Manager 已尝试恢复"
   fi
+  write_snapshot_metadata "$snapshot_dir" "$(basename "$snapshot_dir")" migration consistent \
+    "旧 Manager 迁移前保护点" pre-migration.tar.gz "$install_dir" \
+    "compose,secrets,manager-data,legacy-inspect" "legacy-migration" || {
+    docker start "$LEGACY_CPAM_CONTAINER" >/dev/null || true
+    die "迁移快照元数据生成失败，旧 Manager 已尝试恢复"
+  }
 
   docker inspect "$LEGACY_CPAM_CONTAINER" > "$snapshot_dir/legacy-container-inspect.json" 2>/dev/null || true
-  cat > "$snapshot_dir/manifest.env" <<EOF
-INSTALL_DIR=$install_dir
-CPA_HOST_PORT=$cpa_host_port
-CPAM_HOST_PORT=$cpam_host_port
-LEGACY_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$LEGACY_CPAM_CONTAINER" 2>/dev/null || true)
-PLUS_IMAGE=$CPAM_IMAGE
-CREATED_AT=$(timestamp)
-EOF
   printf '%s\n' "$snapshot_dir" > "$install_dir/.last-migration-backup"
   mv -f "$temp_compose" "$install_dir/docker-compose.yml"
   upsert_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" "$cpamp_admin_key"
@@ -2714,8 +3233,10 @@ EOF
   fi
 
   docker rm "$LEGACY_CPAM_CONTAINER" >/dev/null || warn "旧 Manager 容器删除失败，请确认其保持停止"
-  if ! create_consistent_backup_archive "$install_dir" "$snapshot_dir/post-migration.tar.gz" manager docker-compose.yml .secrets.txt cpa-manager-data; then
+  if ! create_consistent_snapshot_archive "$install_dir" "$snapshot_dir/post-migration.tar.gz" manager docker-compose.yml .secrets.txt cpa-manager-data; then
     warn "迁移已成功，但迁移后快照失败；Plus 已尝试恢复运行，请稍后执行 snapshot"
+  else
+    append_secondary_snapshot_archive "$snapshot_dir/metadata.env" "$snapshot_dir/post-migration.tar.gz" post_migration || warn "迁移后快照校验元数据写入失败"
   fi
   log "迁移成功。访问地址和端口保持不变: http://服务器IP:${cpam_host_port}/management.html"
   log "如需回滚，请运行: bash cpa-cpam-manager.sh rollback"
@@ -2734,7 +3255,7 @@ print_help() {
   menu       交互菜单
   install    安装 / 重装 CPA + CPA Manager Plus
   upgrade    升级 CPA + CPA Manager Plus
-  preflight  只读检查当前安装和迁移条件
+  migration-assess  合并检查迁移条件并显示迁移计划（只读）
   migrate    正式迁移旧 Manager（可加 --dry-run）
   rollback   回滚最近一次迁移
   audit-consumption  消费行为审计：分别查看成功和失败 IP 排名
@@ -2744,10 +3265,13 @@ print_help() {
   stop       停止
   restart    重启
   status     状态 / 健康检查
+  doctor     配置体检（只读）
   logs       查看日志
   snapshot   创建快照
   snapshots  查看现有快照
   restore-snapshot  恢复快照
+  snapshot-delete   删除指定人工或定时快照
+  snapshot-schedule 配置自动定时快照和滚动保留
   keys       查看密钥 / 地址
   uninstall  卸载
   help       显示帮助
@@ -2775,22 +3299,26 @@ CPA Manager Plus 运维控制台
   1) 安装 / 重装             2) 升级
   3) 启动                     4) 停止
   5) 重启                     6) 状态 / 健康检查
+  7) 配置体检（只读）
 
 运行维护
-  7) 查看日志                 8) 创建快照
-  9) 查看密钥 / 地址         10) Codex OAuth 登录
- 17) 重新生成管理密钥        18) 查看现有快照
- 19) 恢复快照
+  8) 查看日志                 9) 查看密钥 / 地址
+ 10) 重新生成管理密钥        11) Codex OAuth 登录
+
+快照与恢复
+ 12) 创建快照                13) 查看现有快照
+ 14) 恢复快照                15) 删除指定快照
+ 16) 定时快照设置
 
 数据与迁移
- 11) 迁移预检               12) 查看迁移计划
- 13) 正式迁移到 Plus        14) 回滚最近迁移
+ 17) 迁移评估（只读）        18) 正式迁移到 Plus
+ 19) 回滚最近迁移
 
 审计与安全
- 15) 消费行为审计           20) 管理行为审计
+ 20) 消费行为审计            21) 管理行为审计
 
 其他
- 16) 卸载
+ 22) 卸载
 
   0) 退出
 ────────────────────────────────────────────────────────
@@ -2803,7 +3331,7 @@ menu_loop() {
     clear_screen
     show_menu_status
     print_main_menu
-    printf "请选择操作 [0-20]: "
+    printf "请选择操作 [0-22]: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -2812,20 +3340,22 @@ menu_loop() {
       4) stop_cpa_cpam ;;
       5) restart_cpa_cpam ;;
       6) status_cpa_cpam ;;
-      7) logs_cpa_cpam ;;
-      8) create_snapshot ;;
+      7) configuration_doctor || true ;;
+      8) logs_cpa_cpam ;;
       9) show_keys ;;
-      10) codex_login_hint ;;
-      11) preflight_cpa_cpam ;;
-      12) migrate_dry_run ;;
-      13) migrate_cpa_cpam ;;
-      14) rollback_cpa_cpam ;;
-      15) consumption_audit ;;
-      16) uninstall_cpa_cpam ;;
-      17) reset_management_keys ;;
-      18) list_snapshots ;;
-      19) restore_snapshot ;;
-      20) management_audit ;;
+      10) reset_management_keys ;;
+      11) codex_login_hint ;;
+      12) create_snapshot ;;
+      13) list_snapshots ;;
+      14) restore_snapshot ;;
+      15) delete_snapshot ;;
+      16) configure_snapshot_schedule ;;
+      17) migration_assess ;;
+      18) migrate_cpa_cpam ;;
+      19) rollback_cpa_cpam ;;
+      20) consumption_audit ;;
+      21) management_audit ;;
+      22) uninstall_cpa_cpam ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
@@ -2846,15 +3376,12 @@ main() {
       print_help
       return 0
       ;;
-    preflight)
-      preflight_cpa_cpam
-      return $?
-      ;;
     migrate)
       install_basic_deps
       ensure_docker_interactive
       if [ "$command_option" = "--dry-run" ]; then
-        migrate_dry_run
+        warn "migrate --dry-run 已合并为 migration-assess；正在执行统一迁移评估"
+        migration_assess
       elif [ -z "$command_option" ]; then
         migrate_cpa_cpam
       else
@@ -2868,7 +3395,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|logs|snapshot|snapshots|restore-snapshot|keys|reset-keys|uninstall|codex-login|security|audit-consumption|audit-management)
+    menu|install|upgrade|start|stop|restart|status|doctor|logs|snapshot|snapshots|restore-snapshot|snapshot-delete|snapshot-schedule|scheduled-snapshot|keys|reset-keys|uninstall|codex-login|audit-consumption|audit-management|migration-assess|preflight)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -2886,16 +3413,25 @@ main() {
     stop) stop_cpa_cpam ;;
     restart) restart_cpa_cpam ;;
     status) status_cpa_cpam ;;
+    doctor) configuration_doctor ;;
     logs) logs_cpa_cpam ;;
     snapshot) create_snapshot ;;
     snapshots) list_snapshots ;;
     restore-snapshot) restore_snapshot ;;
+    snapshot-delete) delete_snapshot ;;
+    snapshot-schedule) configure_snapshot_schedule ;;
+    scheduled-snapshot) run_scheduled_snapshot ;;
     keys) show_keys ;;
     reset-keys) reset_management_keys ;;
     uninstall) uninstall_cpa_cpam ;;
     codex-login) codex_login_hint ;;
-    security|audit-consumption) consumption_audit ;;
+    audit-consumption) consumption_audit ;;
     audit-management) management_audit ;;
+    migration-assess) migration_assess ;;
+    preflight)
+      warn "preflight 已合并为 migration-assess；正在执行统一迁移评估"
+      migration_assess
+      ;;
   esac
 }
 

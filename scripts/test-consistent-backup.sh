@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 export PATH="/usr/bin:/bin:/mingw64/bin:/cmd:${PATH:-}"
 
-# 模拟运行中的 CPA 与 Manager，验证一致性备份的停机和恢复顺序。
+# 模拟运行中的 CPA 与 Manager，验证一致性快照的停机和恢复顺序。
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=cpa-cpam-manager.sh
 NO_COLOR=1 source "$ROOT_DIR/cpa-cpam-manager.sh"
@@ -54,13 +54,13 @@ docker() {
 }
 
 BACKUP_FILE="$TEMP_DIR/backup.tar.gz"
-create_consistent_backup_archive \
+create_consistent_snapshot_archive \
   "$TEMP_DIR/install" \
   "$BACKUP_FILE" \
   all \
   docker-compose.yml auths logs cpa-manager-data
 
-verify_backup_archive "$BACKUP_FILE"
+verify_snapshot_archive "$BACKUP_FILE"
 
 EXPECTED_TRACE=$'stop cpa-manager-plus\nstop cli-proxy-api\nstart cli-proxy-api\nstart cpa-manager-plus'
 ACTUAL_TRACE="$(cat "$TRACE_FILE")"
@@ -69,7 +69,7 @@ if [ "$ACTUAL_TRACE" != "$EXPECTED_TRACE" ]; then
   exit 1
 fi
 
-printf '一致性备份模拟检查通过。\n'
+printf '一致性快照模拟检查通过。\n'
 
 # 验证不停机备份会生成可读的 SQLite 在线快照和备份清单。
 if [ -n "$PYTHON_BIN" ]; then
@@ -89,8 +89,8 @@ PY
   printf 'MGT_KEY=test\n' > "$TEMP_DIR/install/.secrets.txt"
 
   ONLINE_BACKUP_FILE="$TEMP_DIR/online-backup.tar.gz"
-  create_online_backup_archive "$TEMP_DIR/install" "$ONLINE_BACKUP_FILE"
-  verify_backup_archive "$ONLINE_BACKUP_FILE"
+  create_online_snapshot_archive "$TEMP_DIR/install" "$ONLINE_BACKUP_FILE"
+  verify_snapshot_archive "$ONLINE_BACKUP_FILE"
   tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './BACKUP-MANIFEST.txt'
   tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './cpa-manager-data/usage.sqlite'
   tar -xOf "$ONLINE_BACKUP_FILE" ./BACKUP-MANIFEST.txt | grep -Fq '快速不停机快照'
@@ -98,7 +98,16 @@ PY
   create_snapshot_record "$TEMP_DIR/install" manual manual "自动测试备注" online
   [ -f "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" ]
   [ -f "$CREATED_SNAPSHOT_DIR/metadata.env" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" format_version)" = "2" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" script_version)" = "$SCRIPT_VERSION" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" restore_scope)" = "managed-deployment" ]
   [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" remark)" = "自动测试备注" ]
+  snapshot_can_be_deleted manual manual-2026-07-12-000000
+  snapshot_can_be_deleted system scheduled-2026-07-12-030000
+  if snapshot_can_be_deleted system pre-upgrade-2026-07-12-000000; then
+    printf '升级前系统保护点不应允许通过普通入口删除。\n' >&2
+    exit 1
+  fi
   SNAPSHOT_CHECKSUM="$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" checksum_sha256)"
   verify_restorable_snapshot "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" "$SNAPSHOT_CHECKSUM"
   cp "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" "$TEMP_DIR/corrupted-snapshot.tar.gz"
@@ -109,6 +118,15 @@ PY
   fi
   collect_and_print_snapshots "$TEMP_DIR/install" >/dev/null
   [ "${#SNAPSHOT_DIRS[@]}" -eq 1 ]
+
+  mkdir -p "$TEMP_DIR/install/snapshots/system"
+  cp -a "$CREATED_SNAPSHOT_DIR" "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-10-030000"
+  cp -a "$CREATED_SNAPSHOT_DIR" "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-11-030000"
+  touch -t 202607100300 "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-10-030000/metadata.env"
+  touch -t 202607110300 "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-11-030000/metadata.env"
+  prune_scheduled_snapshots "$TEMP_DIR/install" 1
+  [ ! -d "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-10-030000" ]
+  [ -d "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-11-030000" ]
   printf '不停机快照与目录元数据模拟检查通过。\n'
 else
   printf '本机没有可用 Python，跳过不停机 SQLite 快照模拟。\n'
@@ -116,16 +134,16 @@ fi
 
 # 模拟归档失败，确认两个容器仍按正确顺序恢复。
 : > "$TRACE_FILE"
-create_backup_archive() {
+create_snapshot_archive() {
   return 1
 }
 
-if create_consistent_backup_archive \
+if create_consistent_snapshot_archive \
   "$TEMP_DIR/install" \
   "$TEMP_DIR/failed-backup.tar.gz" \
   all \
   docker-compose.yml auths logs cpa-manager-data; then
-  printf '归档失败时一致性备份应返回失败。\n' >&2
+  printf '归档失败时一致性快照应返回失败。\n' >&2
   exit 1
 fi
 
@@ -135,4 +153,4 @@ if [ "$ACTUAL_TRACE" != "$EXPECTED_TRACE" ]; then
   exit 1
 fi
 
-printf '一致性备份失败恢复检查通过。\n'
+printf '一致性快照失败恢复检查通过。\n'

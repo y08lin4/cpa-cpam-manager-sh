@@ -128,8 +128,7 @@ bash cpa-cpam-manager.sh snapshots
 | `menu` | 打开交互菜单 |
 | `install` | 安装或重装 CPA + CPA Manager Plus |
 | `upgrade` | 创建保护快照后拉取镜像并升级 Plus 部署 |
-| `preflight` | 只读检查旧安装、挂载和迁移条件 |
-| `migrate --dry-run` | 输出迁移计划，不修改文件或停止容器 |
+| `migration-assess` | 一次完成迁移条件检查并显示迁移计划，全程只读 |
 | `migrate` | 正式迁移旧 CPA-Manager，并在失败时自动回滚 |
 | `rollback` | 恢复最近一次迁移前快照 |
 | `audit-consumption` | 消费行为审计，分别显示消费成功和消费失败 IP 排名 |
@@ -138,10 +137,13 @@ bash cpa-cpam-manager.sh snapshots
 | `stop` | 停止 Compose 服务 |
 | `restart` | 重启 Compose 服务 |
 | `status` | 显示安装类型、容器状态和健康检查 |
+| `doctor` | 只读检查 Compose、配置、端口、权限、SQLite、挂载和磁盘 |
 | `logs` | 查看 CPA 或当前 Manager 日志 |
 | `snapshot` | 创建带可选备注的人工快照 |
 | `snapshots` | 按时间、类型、模式和大小查看现有快照 |
 | `restore-snapshot` | 选择并恢复快照，失败时自动回退 |
+| `snapshot-delete` | 按编号删除指定人工或定时快照 |
+| `snapshot-schedule` | 配置 systemd 自动定时快照和滚动保留 |
 | `keys` | 显示密钥和访问地址 |
 | `reset-keys` | 重新生成 Plus 管理员密钥、CPA Management Key 或两者 |
 | `codex-login` | 输出 Codex OAuth 登录命令提示 |
@@ -211,29 +213,24 @@ CPA 可能会把 `config.yaml` 中的 `remote-management.secret-key` 转为 bcry
 
 ## 从旧 CPA-Manager 迁移
 
-### 1. 只读预检
+### 1. 迁移评估
 
 ```bash
-bash cpa-cpam-manager.sh preflight
+bash cpa-cpam-manager.sh migration-assess
 ```
 
-预检会展示：
+迁移评估在一次只读执行中同时展示：
 
 - 当前安装类型和安装目录。
 - 新旧 Manager 容器、镜像和状态。
 - `/data` 实际挂载来源。
 - CPA 用量统计和远程管理配置。
 - 是否允许进入自动迁移流程。
+- 完整迁移步骤、停机范围、验证项目和回滚方式。
 
-### 2. 查看迁移计划
+该命令不会停止容器，也不会修改 Compose、密钥或数据。旧 `preflight` 和 `migrate --dry-run` 暂时转发到同一评估逻辑，但不再作为独立菜单功能。
 
-```bash
-bash cpa-cpam-manager.sh migrate --dry-run
-```
-
-该命令不会停止容器，也不会修改 Compose、密钥或数据。
-
-### 3. 正式迁移
+### 2. 正式迁移
 
 ```bash
 bash cpa-cpam-manager.sh migrate
@@ -250,7 +247,7 @@ bash cpa-cpam-manager.sh migrate
 7. 验证失败时自动恢复迁移前快照。
 8. 验证成功后生成迁移后快照。
 
-### 4. 手工回滚
+### 3. 手工回滚
 
 ```bash
 bash cpa-cpam-manager.sh rollback
@@ -303,7 +300,7 @@ bash cpa-cpam-manager.sh audit-management
 
 经用户确认后，脚本会把两张榜单前 30 名中去重后的公网 IP 通过 [IP-API Batch](https://ip-api.com/docs/api:batch) 批量查询国家、地区、城市、ASN、运营商、代理和机房标记。单批最多发送 100 个公网 IP；内网和回环地址不会发送。免费 Batch 端点使用 HTTP，脚本会在调用前明确提示这一隐私与传输风险；接口失败或限流不会影响本地排行榜。
 
-解析器同时支持 CLIProxyAPI 的 Gin 访问日志格式和 Plus 的 `http 方法 路径 status=... remote=...` 官方格式。旧命令 `security` 保留为消费行为审计的兼容别名，不再输出混合榜单。
+解析器同时支持 CLIProxyAPI 的 Gin 访问日志格式和 Plus 的 `http 方法 路径 status=... remote=...` 官方格式。旧混合菜单和 `security` 命令已经删除，不再保留可能误解为混合统计的入口。
 
 升级前自动创建：
 
@@ -323,6 +320,16 @@ bash cpa-cpam-manager.sh status
 
 状态命令会检查 CPA `/v1/models`、Plus `/health`、`/usage-service/info`、鉴权 `/status` 和管理页面。
 
+菜单状态、状态检查、升级检查和迁移评估共用同一个只读运行状态采集器，安装类型、容器、镜像、镜像 ID、运行状态和端口不会再由不同功能分别推断。
+
+### 配置体检
+
+```bash
+bash cpa-cpam-manager.sh doctor
+```
+
+配置体检不会自动修改文件。它会检查 Compose 解析、CLIProxyAPI 关键配置、主端口、`.secrets.txt` 与 `data.key` 权限、SQLite `quick_check`、Manager `/data` 挂载、快照目录权限、磁盘空间，以及新旧 Manager 是否冲突。存在错误时命令返回非零；警告项只提示人工确认。
+
 ### 查看日志
 
 ```bash
@@ -337,6 +344,8 @@ bash cpa-cpam-manager.sh logs
 bash cpa-cpam-manager.sh snapshot
 bash cpa-cpam-manager.sh snapshots
 bash cpa-cpam-manager.sh restore-snapshot
+bash cpa-cpam-manager.sh snapshot-delete
+bash cpa-cpam-manager.sh snapshot-schedule
 ```
 
 创建快照时备注可直接回车跳过，并可选择两种模式：
@@ -344,7 +353,13 @@ bash cpa-cpam-manager.sh restore-snapshot
 - 快速不停机快照（默认）：服务保持运行，保存 Compose、配置、密钥和认证文件，并通过 Python SQLite 在线备份 API 生成可校验的 `usage.sqlite` 时间点快照；不包含运行日志。
 - 完整一致性快照：短暂停止 Manager 和 CLIProxyAPI，保存配置、凭证和完整 Manager 数据，适合重大变更前保护和灾难恢复。
 
-安装成功后，脚本自动创建备注为“初始安装”的系统快照。升级、密钥重置和人工恢复前也会自动建立系统保护点。快速快照中的认证文件属于尽力快照，后续新增数据会进入下一次快照；原始日志不进入普通快照，恢复时也不会删除日志。
+安装成功后，脚本自动创建备注为“初始安装”的系统快照。升级、密钥重置和人工恢复前也会自动建立系统保护点。人工快照、系统保护点和迁移快照统一使用 v2 `metadata.env`，记录原因、时间、大小、SHA-256、脚本版本、镜像与摘要、包含内容和恢复范围。快速快照中的认证文件属于尽力快照，后续新增数据会进入下一次快照；原始日志不进入普通快照，恢复时也不会删除日志。
+
+“删除指定快照”按列表编号选择，只允许删除受管的人工快照或 `scheduled-*` 定时快照。初始安装、升级前、密钥重置前和恢复前系统保护点不能通过普通入口删除。
+
+“定时快照设置”会安装并启用 systemd timer，可选择每天或每周创建快速不停机快照，并设置保留最近 1-100 个自动快照。滚动清理只处理 `scheduled-*`；人工快照、系统保护点和迁移快照不会被自动删除。
+
+定时任务使用安装目录 `bin/` 中的受管脚本副本。更新本仓库脚本后应重新运行一次 `snapshot-schedule`，让定时任务同步使用新版本。卸载服务时脚本会自动停用并删除对应 systemd timer。
 
 快照列表使用固定列展示编号、类型、创建时间、模式、大小和备注。每个快照使用独立目录，归档与元数据不会混在一起：
 
@@ -358,7 +373,8 @@ bash cpa-cpam-manager.sh restore-snapshot
 │   ├── initial-install-YYYY-MM-DD-HHMMSS/
 │   ├── pre-upgrade-YYYY-MM-DD-HHMMSS/
 │   ├── pre-key-reset-YYYY-MM-DD-HHMMSS/
-│   └── pre-restore-YYYY-MM-DD-HHMMSS/
+│   ├── pre-restore-YYYY-MM-DD-HHMMSS/
+│   └── scheduled-YYYY-MM-DD-HHMMSS/
 └── migration/
 ```
 
@@ -368,7 +384,7 @@ bash cpa-cpam-manager.sh restore-snapshot
 
 ```text
 /opt/cliproxy-cpam/snapshots/migration/migration-YYYY-MM-DD-HHMMSS/
-├── manifest.env
+├── metadata.env
 ├── legacy-container-inspect.json
 ├── pre-migration.tar.gz
 ├── post-migration.tar.gz
@@ -420,10 +436,15 @@ bash cpa-cpam-manager.sh uninstall
 ├── cpa-manager-data/
 │   ├── usage.sqlite
 │   └── data.key
-└── snapshots/
-    ├── manual/
-    ├── system/
-    └── migration/
+├── snapshots/
+│   ├── manual/
+│   ├── system/
+│   └── migration/
+├── bin/
+│   └── cpa-cpam-manager.sh（启用定时快照后生成）
+└── state/
+    ├── snapshot-schedule.env
+    └── snapshot.lock
 ```
 
 | 路径 | 说明 |
@@ -434,8 +455,10 @@ bash cpa-cpam-manager.sh uninstall
 | `logs/` | CLIProxyAPI 文件日志 |
 | `cpa-manager-data/` | Plus SQLite、WAL、SHM 和数据加密密钥 |
 | `snapshots/manual/` | 用户主动创建的快照，每份使用独立目录 |
-| `snapshots/system/` | 安装、升级、密钥重置和恢复前的自动保护点 |
+| `snapshots/system/` | 安装、升级、密钥重置、恢复前保护点和定时快照 |
 | `snapshots/migration/` | 旧 Manager 迁移前后文件和诊断材料 |
+| `bin/` | systemd 定时任务使用的受管脚本副本 |
+| `state/` | 定时快照策略和并发锁文件，权限受限 |
 
 ## 端口与防火墙
 

@@ -48,10 +48,23 @@ if grep -Fq '1455' <<<"$OUTPUT"; then
   printf '状态卡不应显示非主端口。\n' >&2
   exit 1
 fi
+collect_runtime_status "$DEFAULT_INSTALL_DIR"
+[ "$RUNTIME_INSTALL_TYPE" = "legacy" ]
+[ "$RUNTIME_MANAGER_CONTAINER" = "$LEGACY_CPAM_CONTAINER" ]
+[ "$RUNTIME_CPA_STATE" = "running" ]
+[ "$RUNTIME_LEGACY_STATE" = "exited" ]
 
 MENU_OUTPUT="$(print_main_menu)"
-grep -Fq '15) 消费行为审计' <<<"$MENU_OUTPUT"
-grep -Fq '20) 管理行为审计' <<<"$MENU_OUTPUT"
+grep -Fq '7) 配置体检（只读）' <<<"$MENU_OUTPUT"
+grep -Fq '15) 删除指定快照' <<<"$MENU_OUTPUT"
+grep -Fq '16) 定时快照设置' <<<"$MENU_OUTPUT"
+grep -Fq '17) 迁移评估（只读）' <<<"$MENU_OUTPUT"
+grep -Fq '20) 消费行为审计' <<<"$MENU_OUTPUT"
+grep -Fq '21) 管理行为审计' <<<"$MENU_OUTPUT"
+if grep -Fq '查看迁移计划' <<<"$MENU_OUTPUT"; then
+  printf '迁移计划已合并进迁移评估，不应保留独立入口。\n' >&2
+  exit 1
+fi
 if grep -Fq '安全巡检 / 24h IP' <<<"$MENU_OUTPUT"; then
   printf '主菜单不应继续显示混合行为的旧安全巡检入口。\n' >&2
   exit 1
@@ -86,5 +99,14 @@ replace_cpa_management_key "$TEMP_DIR/config.yaml" "mgt-cpa-new-key"
 replace_compose_admin_key "$TEMP_DIR/docker-compose.yml" "cpamp_new-key"
 grep -Fq 'secret-key: "mgt-cpa-new-key"' "$TEMP_DIR/config.yaml"
 grep -Fq 'CPA_MANAGER_ADMIN_KEY: "cpamp_new-key"' "$TEMP_DIR/docker-compose.yml"
+
+# 验证统一迁移评估会在一次只读执行中同时输出条件检查和迁移计划。
+preflight_cpa_cpam() {
+  RUNTIME_INSTALL_TYPE="legacy"
+  printf '迁移条件检查完成\n'
+}
+MIGRATION_ASSESS_OUTPUT="$(migration_assess)"
+grep -Fq '迁移条件检查完成' <<<"$MIGRATION_ASSESS_OUTPUT"
+grep -Fq '迁移计划（未执行任何写操作）' <<<"$MIGRATION_ASSESS_OUTPUT"
 
 printf '终端界面模拟检查通过。\n'
