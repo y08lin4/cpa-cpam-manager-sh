@@ -15,7 +15,7 @@ elif python3 -c 'import ipaddress' >/dev/null 2>&1; then
 elif python -c 'import ipaddress' >/dev/null 2>&1; then
   PYTHON_BIN=python
 else
-  printf '本机没有可用 Python，跳过安全巡检 IP 提取模拟；CI 会执行。\n'
+  printf '本机没有可用 Python，跳过安全巡检 IP 提取模拟。\n'
   exit 0
 fi
 export PYTHON_BIN
@@ -93,7 +93,7 @@ EOF
   grep -Fq '美国 / Virginia / Ashburn' <<<"$RANKING"
   grep -Fq '内网/本地地址' <<<"$RANKING"
 else
-  printf '本机没有 jq，跳过 IP-API Batch 模拟；CI 会执行。\n'
+  printf '本机没有 jq，跳过 IP-API Batch 模拟。\n'
 fi
 
 printf '安全巡检 IP 提取模拟检查通过。\n'

@@ -1618,7 +1618,8 @@ reset_cpa_management_key() {
 rollback_management_key_reset() {
   local install_dir="$1"
   local backup_file="$2"
-  local failed_dir="$install_dir/cpa-manager-data.failed-key-reset-$(timestamp)"
+  local failed_dir
+  failed_dir="$install_dir/cpa-manager-data.failed-key-reset-$(timestamp)"
 
   warn "密钥验证失败，正在恢复操作前快照"
   compose_in_dir "$install_dir" stop >/dev/null 2>&1 || true

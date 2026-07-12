@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # 兼容由 Windows 外部程序直接启动、未加载 profile 的 Git Bash。
 export PATH="/usr/bin:/bin:/mingw64/bin:/cmd:${PATH:-}"
 
-# 项目统一静态检查入口：本地和 CI 使用相同的基础检查命令。
+# 项目统一静态检查入口，本地开发和服务器验收使用相同命令。
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_FILE="$ROOT_DIR/cpa-cpam-manager.sh"
 
@@ -30,7 +30,7 @@ printf '[3/3] ShellCheck\n'
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -x "$SCRIPT_FILE" "$ROOT_DIR"/scripts/*.sh
 else
-  printf '未安装 shellcheck，已跳过；CI 会执行该检查。\n'
+  printf '未安装 shellcheck，已跳过；建议安装后重新执行。\n'
 fi
 
 printf '[附加 1/4] 终端界面模拟检查\n'

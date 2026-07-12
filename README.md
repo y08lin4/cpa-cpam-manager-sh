@@ -261,7 +261,7 @@ bash cpa-cpam-manager.sh rollback
 <安装目录>/cpa-manager-data -> /data
 ```
 
-Docker named volume、自定义宿主机目录或无法确认的数据挂载会被安全阻断，不会尝试猜测或移动数据。后续功能建议与实施优先级见 [CLIProxyAPI 与 CPA Manager Plus 功能路线图](ROADMAP.md)。
+Docker named volume、自定义宿主机目录或无法确认的数据挂载会被安全阻断，不会尝试猜测或移动数据。后续功能建议与实施优先级见 [CLIProxyAPI 与 CPA Manager Plus 功能路线图](ROADMAP.md)。模型调用、管理行为分类和无损清除方案见 [行为审计与无损清除设计稿](AUDIT_DESIGN.md)。
 
 ## 日常运维
 

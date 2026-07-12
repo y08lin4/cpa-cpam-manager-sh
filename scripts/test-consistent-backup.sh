@@ -96,7 +96,7 @@ PY
   tar -xOf "$ONLINE_BACKUP_FILE" ./BACKUP-MANIFEST.txt | grep -Fq '快速不停机备份'
   printf '不停机备份模拟检查通过。\n'
 else
-  printf '本机没有可用 Python，跳过不停机 SQLite 备份模拟；CI 会执行。\n'
+  printf '本机没有可用 Python，跳过不停机 SQLite 备份模拟。\n'
 fi
 
 # 模拟归档失败，确认两个容器仍按正确顺序恢复。
