@@ -8,6 +8,17 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=cpa-cpam-manager.sh
 NO_COLOR=1 source "$ROOT_DIR/cpa-cpam-manager.sh"
 
+if [ -n "${PYTHON_BIN:-}" ] && "$PYTHON_BIN" -c 'import sqlite3' >/dev/null 2>&1; then
+  :
+elif python3 -c 'import sqlite3' >/dev/null 2>&1; then
+  PYTHON_BIN=python3
+elif python -c 'import sqlite3' >/dev/null 2>&1; then
+  PYTHON_BIN=python
+else
+  PYTHON_BIN=""
+fi
+export PYTHON_BIN
+
 TEMP_DIR="$(mktemp -d)"
 TRACE_FILE="$TEMP_DIR/docker.trace"
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -59,6 +70,34 @@ if [ "$ACTUAL_TRACE" != "$EXPECTED_TRACE" ]; then
 fi
 
 printf '一致性备份模拟检查通过。\n'
+
+# 验证不停机备份会生成可读的 SQLite 在线快照和备份清单。
+if [ -n "$PYTHON_BIN" ]; then
+  rm -f "$TEMP_DIR/install/cpa-manager-data/usage.sqlite"
+  "$PYTHON_BIN" - "$TEMP_DIR/install/cpa-manager-data/usage.sqlite" <<'PY'
+import sqlite3
+import sys
+
+db = sqlite3.connect(sys.argv[1])
+db.execute("create table if not exists usage_events (id integer primary key, value text)")
+db.execute("insert into usage_events(value) values ('online-backup-test')")
+db.commit()
+db.close()
+PY
+  printf 'data-key-test\n' > "$TEMP_DIR/install/cpa-manager-data/data.key"
+  printf 'remote-management:\n  secret-key: "test"\n' > "$TEMP_DIR/install/config.yaml"
+  printf 'MGT_KEY=test\n' > "$TEMP_DIR/install/.secrets.txt"
+
+  ONLINE_BACKUP_FILE="$TEMP_DIR/online-backup.tar.gz"
+  create_online_backup_archive "$TEMP_DIR/install" "$ONLINE_BACKUP_FILE"
+  verify_backup_archive "$ONLINE_BACKUP_FILE"
+  tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './BACKUP-MANIFEST.txt'
+  tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './cpa-manager-data/usage.sqlite'
+  tar -xOf "$ONLINE_BACKUP_FILE" ./BACKUP-MANIFEST.txt | grep -Fq '快速不停机备份'
+  printf '不停机备份模拟检查通过。\n'
+else
+  printf '本机没有可用 Python，跳过不停机 SQLite 备份模拟；CI 会执行。\n'
+fi
 
 # 模拟归档失败，确认两个容器仍按正确顺序恢复。
 : > "$TRACE_FILE"

@@ -49,4 +49,34 @@ if grep -Fq '1455' <<<"$OUTPUT"; then
   exit 1
 fi
 
+# 验证全局确认默认值生效，且非交互环境不会因为默认 Y 自动执行。
+if [ "$CONFIRM_DEFAULT" != "Y" ]; then
+  printf '全局确认默认值应为 Y。\n' >&2
+  exit 1
+fi
+if ask_yes_no "非交互确认测试" "Y"; then
+  printf '非交互环境不应自动确认。\n' >&2
+  exit 1
+fi
+
+# 验证两类管理密钥能够安全替换到配置文件。
+TEMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEMP_DIR"' EXIT
+cat > "$TEMP_DIR/config.yaml" <<'EOF'
+remote-management:
+  allow-remote: true
+  secret-key: "old-management-key"
+debug: false
+EOF
+cat > "$TEMP_DIR/docker-compose.yml" <<'EOF'
+services:
+  cpa-manager-plus:
+    environment:
+      CPA_MANAGER_ADMIN_KEY: "old-admin-key"
+EOF
+replace_cpa_management_key "$TEMP_DIR/config.yaml" "mgt-cpa-new-key"
+replace_compose_admin_key "$TEMP_DIR/docker-compose.yml" "cpamp_new-key"
+grep -Fq 'secret-key: "mgt-cpa-new-key"' "$TEMP_DIR/config.yaml"
+grep -Fq 'CPA_MANAGER_ADMIN_KEY: "cpamp_new-key"' "$TEMP_DIR/docker-compose.yml"
+
 printf '终端界面模拟检查通过。\n'

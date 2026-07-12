@@ -27,7 +27,7 @@
 - 实时显示容器、镜像版本、运行状态和端口映射。
 - 识别 `legacy`、`plus`、`mixed`、`cpa-only` 和 `not-installed` 状态。
 - 提供只读迁移预检、dry-run、正式迁移、自动回滚和手工回滚。
-- 升级前自动备份配置、认证数据和 Manager 数据。
+- 提供默认不停机凭证备份，以及升级、迁移使用的完整一致性备份。
 - 检查 CPA API、Plus `/health`、兼容端点和鉴权状态。
 - 提供日志、密钥查看、Codex OAuth、卸载和 UFW 端口管理。
 
@@ -130,14 +130,15 @@ bash cpa-cpam-manager.sh backup
 | `migrate --dry-run` | 输出迁移计划，不修改文件或停止容器 |
 | `migrate` | 正式迁移旧 CPA-Manager，并在失败时自动回滚 |
 | `rollback` | 恢复最近一次迁移前快照 |
-| `security` | 查看 24 小时访问来源 IP 和服务器出口 IP 信息 |
+| `security` | 查看 24 小时成功/失败调用 IP 排名和公网归属 |
 | `start` | 启动 Compose 服务 |
 | `stop` | 停止 Compose 服务 |
 | `restart` | 重启 Compose 服务 |
 | `status` | 显示安装类型、容器状态和健康检查 |
 | `logs` | 查看 CPA 或当前 Manager 日志 |
-| `backup` | 创建完整运维备份 |
+| `backup` | 选择快速不停机备份或完整一致性备份 |
 | `keys` | 显示密钥和访问地址 |
+| `reset-keys` | 重新生成 Plus 管理员密钥、CPA Management Key 或两者 |
 | `codex-login` | 输出 Codex OAuth 登录命令提示 |
 | `uninstall` | 卸载服务，可选择保留数据 |
 | `help` | 显示命令帮助 |
@@ -167,9 +168,12 @@ bash cpa-cpam-manager.sh install
 | `CPAM_IMAGE` | `seakee/cpa-manager-plus:latest` | Plus 镜像，可指定版本 tag |
 | `CPA_IMAGE` | `eceasy/cli-proxy-api:latest` | CLIProxyAPI 镜像，可指定版本 tag |
 | `ASSUME_YES` | `0` | 设为 `1` 时自动确认高风险操作，仅用于可信自动化环境 |
+| `CONFIRM_DEFAULT` | `Y` | 全局确认默认值；直接按 Enter 确认，设为 `N` 可恢复保守默认 |
 | `IP_API_BATCH_URL` | `http://ip-api.com/batch` | 访客公网 IP 批量归属查询接口；可替换为兼容的 HTTPS 端点 |
 
 自动生成的密钥格式：
+
+`CONFIRM_DEFAULT=Y` 只控制交互终端中直接按 Enter 的行为。cron、管道等非交互环境不会自动确认；可信自动化必须显式设置 `ASSUME_YES=1`。
 
 - `API_KEY`：`sk-cpa-` + 48 位十六进制随机值。
 - `MGT_KEY`：`mgt-cpa-` + 48 位十六进制随机值。
@@ -288,7 +292,7 @@ bash cpa-cpam-manager.sh security
 
 经用户确认后，脚本会把两张榜单前 30 名中去重后的公网 IP 通过 [IP-API Batch](https://ip-api.com/docs/api:batch) 批量查询国家、地区、城市、ASN、运营商、代理和机房标记。单批最多发送 100 个公网 IP；内网和回环地址不会发送。免费 Batch 端点使用 HTTP，脚本会在调用前明确提示这一隐私与传输风险；接口失败或限流不会影响本地排行榜。
 
-随后脚本会单独询问是否调用 [IPPure](https://my.ippure.com/v1/info)。该接口返回服务器出口 IP 的位置、ASN 等信息，不用于查询每一个访问者 IP。接口若返回风险系数、原生 IP、机房 IP 字段则展示；未返回时明确标记“接口未返回”。
+访问日志按 CLIProxyAPI 官方格式解析：日志前缀之后依次为 HTTP 状态码、耗时、客户端 IP、方法和路径。若日志存在但没有匹配记录，脚本会给出查看容器日志和 `logs/main.log` 的诊断命令。
 
 升级前自动创建：
 
@@ -320,12 +324,18 @@ bash cpa-cpam-manager.sh logs
 bash cpa-cpam-manager.sh backup
 ```
 
-为避免 SQLite、认证文件或日志在打包过程中发生变化，脚本会短暂停止 Manager 和 CLIProxyAPI，完成归档与可读性校验后自动恢复原运行状态。迁移后的补充快照只暂停 Manager，不影响 CPA API。
+备份提供两种模式：
+
+- 快速不停机备份（默认）：服务保持运行，备份 Compose、配置、密钥和认证文件，并通过 Python SQLite 在线备份 API 生成可校验的 `usage.sqlite` 时间点快照；不包含运行日志。
+- 完整一致性备份：短暂停止 Manager 和 CLIProxyAPI，备份配置、凭证、日志和完整 Manager 数据，适合升级、迁移和灾难恢复。
+
+升级和迁移仍强制使用完整一致性备份。快速备份中的认证文件属于尽力快照，后续新增数据会进入下一次备份。
 
 常规备份路径：
 
 ```text
-/opt/cliproxy-cpam/backups/cpa-cpam-backup-YYYY-MM-DD-HHMMSS.tar.gz
+/opt/cliproxy-cpam/backups/cpa-cpam-online-YYYY-MM-DD-HHMMSS.tar.gz
+/opt/cliproxy-cpam/backups/cpa-cpam-consistent-YYYY-MM-DD-HHMMSS.tar.gz
 ```
 
 迁移备份路径：
@@ -340,6 +350,16 @@ bash cpa-cpam-manager.sh backup
 ```
 
 Plus 备份必须包含 `/data/data.key`。该文件丢失后，SQLite 中加密保存的 CPA Management Key 无法解密。
+
+### 重新生成管理密钥
+
+```bash
+bash cpa-cpam-manager.sh reset-keys
+```
+
+可以选择只重置 CPA Manager Plus 管理员密钥、只重置 CPA Management Key，或两个全部重置。脚本会自动生成高强度随机密钥，先创建完整一致性快照，再按 CPA Manager Plus 官方 `reset-admin-key` 命令更新登录凭证，并同步更新 CLIProxyAPI 与 Plus 的连接配置。
+
+只有接口验证全部通过后才会显示新密钥；失败时自动恢复旧配置和旧数据。旧密钥以摘要形式保存时无法找回明文，只能从 `.secrets.txt` 或备份查看；不存在可用明文时应执行重新生成。
 
 ### Codex OAuth 登录
 
@@ -422,7 +442,7 @@ bash cpa-cpam-manager.sh uninstall
 
 ### Plus 登录返回 401
 
-确认使用的是 `CPAMP_ADMIN_KEY`。`MGT_KEY` 是 CPA Management Key，不能用于登录 Plus。
+确认使用的是 `CPAMP_ADMIN_KEY`。`MGT_KEY` 是 CPA Management Key，不能用于登录 Plus。当前保存的密钥无效或已经丢失时，运行 `bash cpa-cpam-manager.sh reset-keys`，选择只重置 Plus 管理员密钥或两个全部重置。
 
 ### 迁移后看不到历史数据
 
@@ -434,7 +454,7 @@ bash cpa-cpam-manager.sh uninstall
 
 ### `.secrets.txt` 丢失
 
-CPA 配置中的 Management Key 可能已是 bcrypt hash，不能反推明文。应从备份恢复或重新设置密钥。
+CPA 配置中的 Management Key 可能已是 bcrypt hash，不能反推明文。应从备份恢复，或运行 `reset-keys` 重新生成并验证新的管理密钥。
 
 ## 开发与检查
 

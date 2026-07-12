@@ -14,6 +14,7 @@ CPA_INTERNAL_PORT="8317"
 CPAM_INTERNAL_PORT="18317"
 CPA_MANAGER_SETUP_UPSTREAM="http://cli-proxy-api:8317"
 IP_API_BATCH_URL="${IP_API_BATCH_URL:-http://ip-api.com/batch}"
+CONFIRM_DEFAULT="${CONFIRM_DEFAULT:-Y}"
 
 # 终端配色。设置 NO_COLOR=1 时关闭颜色，兼容不支持 ANSI 的终端和日志采集场景。
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -98,9 +99,19 @@ has_systemd() {
 
 ask_yes_no() {
   local prompt="$1"
-  local default="${2:-Y}"
+  local requested_default="${2:-Y}"
+  local default="${CONFIRM_DEFAULT:-$requested_default}"
   local suffix
   local answer
+
+  case "$default" in
+    y|Y|yes|YES|Yes) default="Y" ;;
+    n|N|no|NO|No) default="N" ;;
+    *)
+      warn "CONFIRM_DEFAULT 仅支持 Y 或 N，当前值 '$default' 无效，已使用 Y"
+      default="Y"
+      ;;
+  esac
 
   if [ "${ASSUME_YES:-0}" = "1" ]; then
     warn "ASSUME_YES=1：自动确认操作：$prompt"
@@ -117,7 +128,8 @@ ask_yes_no() {
     printf "%s %s: " "$prompt" "$suffix"
     read -r answer || answer=""
   else
-    answer=""
+    warn "非交互环境无法确认：$prompt；如需可信自动化，请显式设置 ASSUME_YES=1"
+    return 1
   fi
 
   if [ -z "$answer" ]; then
@@ -791,6 +803,88 @@ create_backup_archive() {
   log "备份完成: $backup_file"
 }
 
+# 在不中断服务的情况下备份配置、凭证，并使用 SQLite 在线备份 API 生成一致的统计数据库快照。
+create_online_backup_archive() {
+  local install_dir="$1"
+  local backup_file="$2"
+  local python_bin="${PYTHON_BIN:-python3}"
+  local staging_dir
+  local item
+  local source_db="$install_dir/cpa-manager-data/usage.sqlite"
+  local target_db
+
+  mkdir -p "$install_dir/backups"
+  staging_dir="$(mktemp -d "$install_dir/backups/.online-backup.XXXXXX")"
+  mkdir -p "$staging_dir/cpa-manager-data"
+
+  for item in docker-compose.yml config.yaml .secrets.txt auths; do
+    if [ -e "$install_dir/$item" ]; then
+      cp -a "$install_dir/$item" "$staging_dir/" || {
+        rm -rf "$staging_dir"
+        return 1
+      }
+    fi
+  done
+
+  if [ -d "$install_dir/cpa-manager-data" ]; then
+    while IFS= read -r -d '' item; do
+      cp -a "$item" "$staging_dir/cpa-manager-data/" || {
+        rm -rf "$staging_dir"
+        return 1
+      }
+    done < <(find "$install_dir/cpa-manager-data" -mindepth 1 -maxdepth 1 \
+      ! -name 'usage.sqlite' ! -name 'usage.sqlite-wal' ! -name 'usage.sqlite-shm' -print0 2>/dev/null)
+  fi
+
+  if [ -s "$source_db" ]; then
+    target_db="$staging_dir/cpa-manager-data/usage.sqlite"
+    if ! "$python_bin" - "$source_db" "$target_db" <<'PY'
+import sqlite3
+import sys
+
+source_path, target_path = sys.argv[1], sys.argv[2]
+source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
+target = sqlite3.connect(target_path)
+try:
+    source.backup(target)
+    result = target.execute("PRAGMA quick_check").fetchone()
+    if not result or result[0] != "ok":
+        raise RuntimeError(f"SQLite quick_check failed: {result}")
+finally:
+    target.close()
+    source.close()
+PY
+    then
+      warn "Manager SQLite 在线快照失败"
+      rm -rf "$staging_dir"
+      return 1
+    fi
+  else
+    warn "未找到 Manager SQLite，快速备份将只包含配置和凭证"
+  fi
+
+  cat > "$staging_dir/BACKUP-MANIFEST.txt" <<EOF
+备份模式：快速不停机备份
+创建时间：$(date -Iseconds)
+强一致内容：Manager SQLite 在线快照
+尽力快照内容：Compose、配置、密钥和认证文件
+未包含内容：运行日志
+说明：服务在备份期间保持运行，后续新增数据由下一次备份继续覆盖。
+EOF
+
+  if ! tar -C "$staging_dir" -czf "$backup_file" .; then
+    rm -f "$backup_file"
+    rm -rf "$staging_dir"
+    return 1
+  fi
+  rm -rf "$staging_dir"
+  verify_backup_archive "$backup_file" || {
+    rm -f "$backup_file"
+    return 1
+  }
+  log "快速不停机备份完成: $backup_file"
+}
+
 # Manager 运行时会持续写入 SQLite。备份前短暂停止 Manager，并在任何结果下恢复原运行状态。
 create_consistent_backup_archive() {
   local install_dir="$1"
@@ -1293,20 +1387,50 @@ EOF
 backup_cpa_cpam() {
   local install_dir
   local backup_file
+  local mode
 
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
-  backup_file="$install_dir/backups/cpa-cpam-backup-$(timestamp).tar.gz"
-  print_section "备份确认"
-  printf '安装目录：%s\n' "$install_dir"
-  printf '备份文件：%s\n' "$backup_file"
-  printf '包含内容：Compose、配置、密钥、认证、日志和 Manager 数据。\n'
-  printf '影响：为保证一致性，CPA 和 Manager 会短暂停止并自动恢复。\n'
-  if ! ask_yes_no "确认创建一致性备份" "N"; then
-    log "已取消备份"
-    return 0
-  fi
-  create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths logs cpa-manager-data || die "一致性备份失败: $backup_file"
+  print_section "选择备份模式"
+  cat <<'EOF'
+1) 快速不停机备份（默认）
+   配置、密钥、认证文件和 SQLite 在线快照；不包含运行日志，服务不中断。
+
+2) 完整一致性备份
+   配置、密钥、认证、日志和完整 Manager 数据；CPA 与 Manager 会短暂停止。
+EOF
+  mode="$(read_with_default "请选择备份模式 [1]: " "1")"
+
+  case "$mode" in
+    1)
+      backup_file="$install_dir/backups/cpa-cpam-online-$(timestamp).tar.gz"
+      print_section "快速不停机备份确认"
+      printf '安装目录：%s\n' "$install_dir"
+      printf '备份文件：%s\n' "$backup_file"
+      printf '影响：服务保持运行；认证文件为尽力快照，SQLite 使用在线备份。\n'
+      if ! ask_yes_no "确认创建快速不停机备份" "Y"; then
+        log "已取消备份"
+        return 0
+      fi
+      create_online_backup_archive "$install_dir" "$backup_file" || die "快速不停机备份失败: $backup_file"
+      ;;
+    2)
+      backup_file="$install_dir/backups/cpa-cpam-consistent-$(timestamp).tar.gz"
+      print_section "完整一致性备份确认"
+      printf '安装目录：%s\n' "$install_dir"
+      printf '备份文件：%s\n' "$backup_file"
+      printf '影响：CPA 和 Manager 会短暂停止并自动恢复。\n'
+      if ! ask_yes_no "确认创建完整一致性备份" "Y"; then
+        log "已取消备份"
+        return 0
+      fi
+      create_consistent_backup_archive "$install_dir" "$backup_file" all docker-compose.yml config.yaml .secrets.txt auths logs cpa-manager-data || die "完整一致性备份失败: $backup_file"
+      ;;
+    *)
+      warn "无效备份模式: $mode"
+      return 1
+      ;;
+  esac
 }
 
 show_keys() {
@@ -1344,6 +1468,251 @@ show_keys() {
   else
     warn "未能从 config.yaml 读取 MGT_KEY"
   fi
+}
+
+# 更新 CLIProxyAPI 配置中的 Management Key，不依赖原值是否已被转换为 bcrypt。
+replace_cpa_management_key() {
+  local config_file="$1"
+  local new_key="$2"
+  local escaped_key
+  local temp_file="${config_file}.tmp.$$"
+
+  escaped_key="$(yaml_escape_double "$new_key")"
+  awk -v value="$escaped_key" '
+    /^remote-management:[[:space:]]*$/ { in_section=1 }
+    in_section && /^[^[:space:]]/ && !/^remote-management:/ { in_section=0 }
+    in_section && /^[[:space:]]+secret-key:/ {
+      print "  secret-key: \"" value "\""
+      updated=1
+      next
+    }
+    { print }
+    END { if (!updated) exit 42 }
+  ' "$config_file" > "$temp_file" || {
+    rm -f "$temp_file"
+    return 1
+  }
+  mv -f "$temp_file" "$config_file"
+}
+
+# 同步 Compose 中的 Plus 管理员密钥，避免数据库重建时又使用旧环境变量。
+replace_compose_admin_key() {
+  local compose_file="$1"
+  local new_key="$2"
+  local escaped_key
+  local temp_file="${compose_file}.tmp.$$"
+
+  escaped_key="$(yaml_escape_double "$new_key")"
+  awk -v value="$escaped_key" '
+    /^[[:space:]]+CPA_MANAGER_ADMIN_KEY:/ {
+      sub(/CPA_MANAGER_ADMIN_KEY:.*/, "CPA_MANAGER_ADMIN_KEY: \"" value "\"")
+      updated=1
+    }
+    { print }
+    END { if (!updated) exit 42 }
+  ' "$compose_file" > "$temp_file" || {
+    rm -f "$temp_file"
+    return 1
+  }
+  mv -f "$temp_file" "$compose_file"
+}
+
+wait_for_bearer_endpoint() {
+  local url="$1"
+  local key="$2"
+  local attempt
+
+  for attempt in 1 2 3 4 5 6; do
+    if curl -fsS --max-time 8 -H "Authorization: Bearer $key" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$attempt" -lt 6 ] && sleep 3
+  done
+  return 1
+}
+
+# 按 CPA Manager Plus 官方 reset-admin-key 命令重置登录密钥。
+reset_plus_admin_key() {
+  local install_dir="$1"
+  local cpam_host_port="$2"
+  local new_key="$3"
+  local key_file="$install_dir/.new-cpamp-admin-key.$$"
+
+  printf '%s\n' "$new_key" > "$key_file"
+  chmod 600 "$key_file"
+  log "停止 CPA Manager Plus 并调用官方密钥重置命令"
+  compose_in_dir "$install_dir" stop cpa-manager-plus >/dev/null || {
+    rm -f "$key_file"
+    return 1
+  }
+  if ! compose_in_dir "$install_dir" run --rm --no-deps \
+    -v "$key_file:/run/secrets/new_admin_key:ro" \
+    cpa-manager-plus reset-admin-key --admin-key-file /run/secrets/new_admin_key >/dev/null; then
+    rm -f "$key_file"
+    compose_in_dir "$install_dir" up -d --no-deps cpa-manager-plus >/dev/null 2>&1 || true
+    return 1
+  fi
+  rm -f "$key_file"
+
+  replace_compose_admin_key "$install_dir/docker-compose.yml" "$new_key" || return 1
+  compose_in_dir "$install_dir" up -d --no-deps cpa-manager-plus >/dev/null || return 1
+  wait_for_bearer_endpoint "http://127.0.0.1:${cpam_host_port}/status" "$new_key"
+}
+
+# 重置 CPA Management Key，并通过 Plus 配置接口同步其 CPA 连接凭证。
+reset_cpa_management_key() {
+  local install_dir="$1"
+  local cpa_host_port="$2"
+  local cpam_host_port="$3"
+  local plus_admin_key="$4"
+  local new_key="$5"
+  local current_config="$install_dir/.cpamp-config-before-key-reset.$$"
+  local update_payload="$install_dir/.cpamp-config-key-reset.$$"
+  local plus_config_url="http://127.0.0.1:${cpam_host_port}/usage-service/config"
+
+  if ! curl -fsS --max-time 10 \
+    -H "Authorization: Bearer $plus_admin_key" \
+    "$plus_config_url" > "$current_config"; then
+    rm -f "$current_config" "$update_payload"
+    warn "无法读取 Plus 当前连接配置；如 Plus 登录密钥也已丢失，请选择两个全部重置"
+    return 1
+  fi
+  if ! jq -e '.config.cpaConnection' "$current_config" >/dev/null 2>&1; then
+    rm -f "$current_config" "$update_payload"
+    warn "Plus 当前连接配置格式异常"
+    return 1
+  fi
+  jq --arg key "$new_key" \
+    '{config: (.config | .cpaConnection.managementKey = $key)}' \
+    "$current_config" > "$update_payload"
+
+  replace_cpa_management_key "$install_dir/config.yaml" "$new_key" || {
+    rm -f "$current_config" "$update_payload"
+    warn "config.yaml 中未找到 remote-management.secret-key"
+    return 1
+  }
+  log "重启 CLIProxyAPI 以应用新的 Management Key"
+  compose_in_dir "$install_dir" restart cli-proxy-api >/dev/null || {
+    rm -f "$current_config" "$update_payload"
+    return 1
+  }
+  if ! wait_for_bearer_endpoint "http://127.0.0.1:${cpa_host_port}/v0/management/config" "$new_key"; then
+    rm -f "$current_config" "$update_payload"
+    warn "CLIProxyAPI 新 Management Key 验证失败"
+    return 1
+  fi
+  if ! curl -fsS --max-time 15 -X PUT \
+    -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $plus_admin_key" \
+    --data-binary "@$update_payload" \
+    "$plus_config_url" >/dev/null; then
+    rm -f "$current_config" "$update_payload"
+    warn "Plus 同步新的 CPA Management Key 失败"
+    return 1
+  fi
+
+  rm -f "$current_config" "$update_payload"
+  return 0
+}
+
+rollback_management_key_reset() {
+  local install_dir="$1"
+  local backup_file="$2"
+  local failed_dir="$install_dir/cpa-manager-data.failed-key-reset-$(timestamp)"
+
+  warn "密钥验证失败，正在恢复操作前快照"
+  compose_in_dir "$install_dir" stop >/dev/null 2>&1 || true
+  if [ -d "$install_dir/cpa-manager-data" ]; then
+    mv "$install_dir/cpa-manager-data" "$failed_dir" || return 1
+  fi
+  rm -f "$install_dir/docker-compose.yml" "$install_dir/config.yaml" "$install_dir/.secrets.txt"
+  tar -C "$install_dir" -xzf "$backup_file" || return 1
+  chmod 600 "$install_dir/.secrets.txt" 2>/dev/null || true
+  compose_in_dir "$install_dir" up -d --remove-orphans >/dev/null || return 1
+  warn "已恢复旧密钥和数据；失败现场保留在 $failed_dir"
+}
+
+reset_management_keys() {
+  local install_dir
+  local install_type
+  local choice
+  local cpa_host_port
+  local cpam_host_port
+  local old_plus_key
+  local new_plus_key=""
+  local new_mgt_key=""
+  local active_plus_key
+  local backup_file
+  local reset_failed="false"
+
+  install_type="$(detect_install_type)"
+  [ "$install_type" = "plus" ] || die "密钥重置仅支持已部署的 CPA Manager Plus"
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  cpa_host_port="$(detect_cpa_port "$install_dir")"
+  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  old_plus_key="$(load_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" || true)"
+
+  print_section "重新生成管理密钥"
+  cat <<'EOF'
+1) 只重置 CPA Manager Plus 管理员密钥
+2) 只重置 CPA Management Key
+3) 两个全部重置
+EOF
+  choice="$(read_with_default "请选择重置范围 [1]: " "1")"
+  case "$choice" in
+    1) new_plus_key="$(generate_cpamp_admin_key)" ;;
+    2) new_mgt_key="$(generate_mgt_key)" ;;
+    3)
+      new_plus_key="$(generate_cpamp_admin_key)"
+      new_mgt_key="$(generate_mgt_key)"
+      ;;
+    *) die "无效重置范围: $choice" ;;
+  esac
+
+  if [ -n "$new_mgt_key" ] && [ -z "$new_plus_key" ] && [ -z "$old_plus_key" ]; then
+    die "未找到当前 Plus 管理员密钥，无法同步 CPA 连接；请选择两个全部重置"
+  fi
+
+  backup_file="$install_dir/backups/pre-key-reset-$(timestamp).tar.gz"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '重置范围：%s\n' "$choice"
+  printf '安全快照：%s\n' "$backup_file"
+  printf '影响：重置期间相关服务会短暂停止；新密钥只在全部验证成功后显示。\n'
+  if ! ask_yes_no "确认重新生成并覆盖所选管理密钥" "Y"; then
+    log "已取消密钥重置"
+    return 0
+  fi
+
+  create_consistent_backup_archive "$install_dir" "$backup_file" all \
+    docker-compose.yml config.yaml .secrets.txt auths cpa-manager-data || die "密钥重置前快照失败"
+
+  active_plus_key="$old_plus_key"
+  if [ -n "$new_plus_key" ]; then
+    if reset_plus_admin_key "$install_dir" "$cpam_host_port" "$new_plus_key"; then
+      active_plus_key="$new_plus_key"
+    else
+      reset_failed="true"
+    fi
+  fi
+  if [ "$reset_failed" = "false" ] && [ -n "$new_mgt_key" ]; then
+    if ! reset_cpa_management_key "$install_dir" "$cpa_host_port" "$cpam_host_port" "$active_plus_key" "$new_mgt_key"; then
+      reset_failed="true"
+    fi
+  fi
+
+  if [ "$reset_failed" = "true" ]; then
+    rollback_management_key_reset "$install_dir" "$backup_file" || die "自动恢复失败，请使用快照手动恢复: $backup_file"
+    die "密钥重置失败，已恢复旧配置"
+  fi
+
+  [ -n "$new_plus_key" ] && upsert_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" "$new_plus_key"
+  [ -n "$new_mgt_key" ] && upsert_secrets_value "$install_dir/.secrets.txt" "MGT_KEY" "$new_mgt_key"
+  print_section "密钥重置成功"
+  printf '%b  新密钥已经写入配置、通过接口验证并保存到 %s/.secrets.txt\n' "$ICON_OK" "$install_dir"
+  [ -n "$new_plus_key" ] && printf 'CPAMP_ADMIN_KEY=%s\n' "$new_plus_key"
+  [ -n "$new_mgt_key" ] && printf 'MGT_KEY=%s\n' "$new_mgt_key"
+  printf '请立即保存以上密钥；旧密钥已经失效。\n'
 }
 
 safe_install_dir_for_delete() {
@@ -1441,6 +1810,8 @@ ip_patterns = [
 status_patterns = [
     re.compile(r'\b(?:status(?:_code)?|http_status|code)\s*[:=]\s*["\']?([1-5][0-9]{2})\b', re.I),
     re.compile(r'"\s+([1-5][0-9]{2})\s+(?:[0-9]+|-)'),
+    # CLIProxyAPI 官方 LogFormatter：日志前缀结束后直接输出“状态码 | 耗时 | IP”。
+    re.compile(r'(?:^|\]\s+)([1-5][0-9]{2})\s*\|'),
     re.compile(r'\|\s*([1-5][0-9]{2})\s*\|'),
 ]
 failure_pattern = re.compile(
@@ -1451,6 +1822,7 @@ failure_pattern = re.compile(
 counts = {
     "success": collections.Counter(),
     "failure": collections.Counter(),
+    "auth_failure": collections.Counter(),
 }
 
 for line in lines:
@@ -1487,8 +1859,10 @@ for line in lines:
     if category:
         for address in addresses:
             counts[category][address] += 1
+            if status in (401, 403):
+                counts["auth_failure"][address] += 1
 
-for category in ("success", "failure"):
+for category in ("success", "failure", "auth_failure"):
     for address, count in counts[category].most_common():
         scope = "public" if ipaddress.ip_address(address).is_global else "internal"
         print(f"{category}\t{count}\t{address}\t{scope}")
@@ -1604,43 +1978,6 @@ query_ranked_ip_geolocation() {
   log "IP-API Batch 归属查询完成"
 }
 
-show_ippure_info() {
-  local response
-  local risk
-  local native
-  local datacenter
-
-  print_section "服务器出口 IP 信息（IPPure）"
-  printf '隐私提示：调用 IPPure 时，对方会收到本机出口 IP 和 curl User-Agent。\n'
-  if ! ask_yes_no "确认调用 https://my.ippure.com/v1/info" "N"; then
-    log "已跳过 IPPure 查询"
-    return 0
-  fi
-
-  if ! response="$(curl -fsSL --max-time 15 https://my.ippure.com/v1/info 2>/dev/null)"; then
-    warn "IPPure API 请求失败"
-    return 1
-  fi
-  if ! jq -e . >/dev/null 2>&1 <<<"$response"; then
-    warn "IPPure API 返回的不是有效 JSON"
-    return 1
-  fi
-
-  printf 'IP：%s\n' "$(jq -r '.ip // "未返回"' <<<"$response")"
-  printf 'ASN：%s\n' "$(jq -r '.asn // "未返回"' <<<"$response")"
-  printf '运营组织：%s\n' "$(jq -r '.asOrganization // .organization // "未返回"' <<<"$response")"
-  printf '位置：%s\n' "$(jq -r '[.country, .region, .city] | map(select(. != null and . != "")) | join(" / ") | if . == "" then "未返回" else . end' <<<"$response")"
-  printf '时区：%s\n' "$(jq -r '.timezone // "未返回"' <<<"$response")"
-  printf '经纬度：%s\n' "$(jq -r 'if .longitude and .latitude then "\(.longitude), \(.latitude)" else "未返回" end' <<<"$response")"
-
-  risk="$(jq -r '.riskScore // .riskCoefficient // .risk // .fraudScore // empty' <<<"$response")"
-  native="$(jq -r '.isNative // .native // empty' <<<"$response")"
-  datacenter="$(jq -r '.isDataCenter // .datacenter // .isHosting // empty' <<<"$response")"
-  printf '风险系数：%s\n' "${risk:-接口未返回}"
-  printf '原生 IP：%s\n' "${native:-接口未返回}"
-  printf '机房 IP：%s\n' "${datacenter:-接口未返回}"
-}
-
 security_audit() {
   local install_dir
   local temp_dir
@@ -1652,6 +1989,7 @@ security_audit() {
   local total_sources
   local success_calls
   local failure_calls
+  local sample_lines
 
   install_dir="$(detect_install_dir)"
   temp_dir="$(mktemp -d)"
@@ -1671,11 +2009,13 @@ security_audit() {
   fi
   awk -F '\t' '$1 == "success" { print $2 "\t" $3 "\t" $4 }' "$ip_report" > "$success_report"
   awk -F '\t' '$1 == "failure" { print $2 "\t" $3 "\t" $4 }' "$ip_report" > "$failure_report"
-  auth_failures="$(grep -Eic '(^|[^0-9])(401|403)([^0-9]|$)|unauthorized|forbidden|invalid.*(key|token)|authentication failed' "$log_sample" 2>/dev/null || true)"
+  auth_failures="$(awk -F '\t' '$1 == "auth_failure" { total += $2 } END { print total + 0 }' "$ip_report")"
   total_sources="$(cut -f 3 "$ip_report" | sort -u | grep -c . || true)"
   success_calls="$(awk -F '\t' '{ total += $1 } END { print total + 0 }' "$success_report")"
   failure_calls="$(awk -F '\t' '{ total += $1 } END { print total + 0 }' "$failure_report")"
+  sample_lines="$(wc -l < "$log_sample" | tr -d ' ')"
 
+  printf '\n日志采样：%s 行\n' "$sample_lines"
   printf '\n已识别调用来源 IP：%s 个\n' "$total_sources"
   printf '成功调用：%s 次    失败调用：%s 次\n' "$success_calls" "$failure_calls"
   if [ "$auth_failures" -gt 0 ]; then
@@ -1687,9 +2027,13 @@ security_audit() {
   print_access_ip_ranking "成功调用 IP 排名（前 30）" "$success_report" "最近 24 小时未识别到成功调用" "$temp_dir/geo-report.tsv"
   print_access_ip_ranking "失败调用 IP 排名（前 30）" "$failure_report" "最近 24 小时未识别到失败调用" "$temp_dir/geo-report.tsv"
   printf '\n说明：仅统计日志中带明确 HTTP 结果的来源 IP；2xx 计为成功，4xx/5xx 或明确失败关键词计为失败。\n'
+  if [ "$sample_lines" -gt 0 ] && [ "$success_calls" -eq 0 ] && [ "$failure_calls" -eq 0 ]; then
+    warn "日志存在但格式未被识别，请运行以下命令查看原始访问记录："
+    printf 'docker logs --since 24h %s | tail -n 50\n' "$CPA_CONTAINER"
+    printf 'tail -n 50 %s/logs/main.log\n' "$install_dir"
+  fi
 
   rm -rf "$temp_dir"
-  show_ippure_info || warn "IPPure 查询未完成，本地 24 小时巡检结果仍然有效"
 }
 
 # -----------------------------------------------------------------------------
@@ -1927,7 +2271,8 @@ print_help() {
   preflight  只读检查当前安装和迁移条件
   migrate    正式迁移旧 Manager（可加 --dry-run）
   rollback   回滚最近一次迁移
-  security   查看 24 小时访问 IP 和服务器出口 IP 信息
+  security   查看 24 小时成功/失败调用 IP 排名和公网归属
+  reset-keys 重新生成 Plus 管理员密钥、CPA Management Key 或两者
   start      启动
   stop       停止
   restart    重启
@@ -1947,6 +2292,7 @@ print_help() {
   MGT_KEY=mgt-cpa-xxx
   CPAMP_ADMIN_KEY=cpamp_xxx
   CPAM_IMAGE=seakee/cpa-manager-plus:latest
+  CONFIRM_DEFAULT=Y
   ASSUME_YES=0
 EOF
 }
@@ -1968,6 +2314,7 @@ CPA Manager Plus 运维控制台
 运行维护
   7) 查看日志                 8) 创建备份
   9) 查看密钥 / 地址         10) Codex OAuth 登录
+ 17) 重新生成管理密钥
 
 数据与迁移
  11) 迁移预检               12) 查看迁移计划
@@ -1979,7 +2326,7 @@ CPA Manager Plus 运维控制台
   0) 退出
 ────────────────────────────────────────────────────────
 EOF
-    printf "请选择操作 [0-16]: "
+    printf "请选择操作 [0-17]: "
     read -r choice || choice="0"
     case "$choice" in
       1) install_cpa_cpam ;;
@@ -1998,6 +2345,7 @@ EOF
       14) rollback_cpa_cpam ;;
       15) security_audit ;;
       16) uninstall_cpa_cpam ;;
+      17) reset_management_keys ;;
       0) log "已退出"; break ;;
       *) warn "无效选项" ;;
     esac
@@ -2040,7 +2388,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|logs|backup|keys|uninstall|codex-login|security)
+    menu|install|upgrade|start|stop|restart|status|logs|backup|keys|reset-keys|uninstall|codex-login|security)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -2061,6 +2409,7 @@ main() {
     logs) logs_cpa_cpam ;;
     backup) backup_cpa_cpam ;;
     keys) show_keys ;;
+    reset-keys) reset_management_keys ;;
     uninstall) uninstall_cpa_cpam ;;
     codex-login) codex_login_hint ;;
     security) security_audit ;;
