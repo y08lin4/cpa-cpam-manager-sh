@@ -81,6 +81,11 @@ if grep -Fq '安全巡检 / 24h IP' <<<"$MENU_OUTPUT"; then
   printf '主菜单不应继续显示混合行为的旧安全巡检入口。\n' >&2
   exit 1
 fi
+HELP_OUTPUT="$(print_help)"
+if grep -Eq '(^|[[:space:]])security([[:space:]]|$)|安全巡检|24h IP' <<<"$HELP_OUTPUT"; then
+  printf '帮助文本不应继续暴露旧混合行为入口。\n' >&2
+  exit 1
+fi
 
 # 验证全局确认默认值生效，且非交互环境不会因为默认 Y 自动执行。
 if [ "$CONFIRM_DEFAULT" != "Y" ]; then
