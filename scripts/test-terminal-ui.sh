@@ -53,6 +53,18 @@ collect_runtime_status "$DEFAULT_INSTALL_DIR"
 [ "$RUNTIME_MANAGER_CONTAINER" = "$LEGACY_CPAM_CONTAINER" ]
 [ "$RUNTIME_CPA_STATE" = "running" ]
 [ "$RUNTIME_LEGACY_STATE" = "exited" ]
+[ "$RUNTIME_CPA_HOST_PORT" = "8317" ]
+[ "$RUNTIME_MANAGER_HOST_PORT" = "18317" ]
+
+# 已完成采集后，兼容端口函数只读取统一结果，不再次访问 Docker。
+docker() {
+  return 1
+}
+RUNTIME_INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+RUNTIME_CPA_HOST_PORT="98317"
+RUNTIME_MANAGER_HOST_PORT="28317"
+[ "$(detect_cpa_port "$DEFAULT_INSTALL_DIR")" = "98317" ]
+[ "$(detect_cpam_port "$DEFAULT_INSTALL_DIR")" = "28317" ]
 
 MENU_OUTPUT="$(print_main_menu)"
 grep -Fq '7) 配置体检（只读）' <<<"$MENU_OUTPUT"

@@ -341,6 +341,7 @@ RUNTIME_CPA_STATE="not-installed"
 RUNTIME_CPA_IMAGE=""
 RUNTIME_CPA_IMAGE_ID=""
 RUNTIME_CPA_PORT="未映射"
+RUNTIME_CPA_HOST_PORT="$DEFAULT_CPA_HOST_PORT"
 RUNTIME_PLUS_EXISTS="false"
 RUNTIME_PLUS_STATE="not-installed"
 RUNTIME_PLUS_IMAGE=""
@@ -351,6 +352,7 @@ RUNTIME_LEGACY_STATE="not-installed"
 RUNTIME_LEGACY_IMAGE=""
 RUNTIME_LEGACY_IMAGE_ID=""
 RUNTIME_LEGACY_PORT="未映射"
+RUNTIME_MANAGER_HOST_PORT="$DEFAULT_CPAM_HOST_PORT"
 
 collect_container_runtime() {
   local name="$1"
@@ -374,6 +376,41 @@ collect_container_runtime() {
   printf -v "RUNTIME_${prefix}_IMAGE" '%s' "$image"
   printf -v "RUNTIME_${prefix}_IMAGE_ID" '%s' "$image_id"
   printf -v "RUNTIME_${prefix}_PORT" '%s' "$port"
+}
+
+resolve_cpa_host_port() {
+  local install_dir="$1"
+  local port
+  local secrets_value
+
+  if port="$(port_from_docker_mapping "$CPA_CONTAINER" "$CPA_INTERNAL_PORT")"; then
+    printf '%s\n' "$port"
+    return 0
+  fi
+  secrets_value="$(load_secrets_value "$install_dir/.secrets.txt" "CPA_API" || true)"
+  if [[ "$secrets_value" =~ :([0-9]+)/v1$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf '%s\n' "${CPA_HOST_PORT:-$DEFAULT_CPA_HOST_PORT}"
+}
+
+resolve_manager_host_port() {
+  local install_dir="$1"
+  local manager_container="$2"
+  local port
+  local secrets_value
+
+  if [ -n "$manager_container" ] && port="$(port_from_docker_mapping "$manager_container" "$CPAM_INTERNAL_PORT")"; then
+    printf '%s\n' "$port"
+    return 0
+  fi
+  secrets_value="$(load_secrets_value "$install_dir/.secrets.txt" "CPA_MANAGER" || true)"
+  if [[ "$secrets_value" =~ :([0-9]+)/management\.html$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf '%s\n' "${CPAM_HOST_PORT:-$DEFAULT_CPAM_HOST_PORT}"
 }
 
 collect_runtime_status() {
@@ -404,6 +441,8 @@ collect_runtime_status() {
   else
     RUNTIME_INSTALL_DIR="$(detect_install_dir)"
   fi
+  RUNTIME_CPA_HOST_PORT="$(resolve_cpa_host_port "$RUNTIME_INSTALL_DIR")"
+  RUNTIME_MANAGER_HOST_PORT="$(resolve_manager_host_port "$RUNTIME_INSTALL_DIR" "$RUNTIME_MANAGER_CONTAINER")"
 }
 
 render_runtime_status_card() {
@@ -580,44 +619,21 @@ port_from_docker_mapping() {
 }
 
 detect_cpa_port() {
-  local install_dir="${1:-$(detect_install_dir)}"
-  local port
-  local secrets_value
-
-  if port="$(port_from_docker_mapping "$CPA_CONTAINER" "$CPA_INTERNAL_PORT")"; then
-    printf '%s\n' "$port"
-    return 0
+  local install_dir="${1:-${RUNTIME_INSTALL_DIR:-$(detect_install_dir)}}"
+  if [ "$RUNTIME_INSTALL_DIR" = "$install_dir" ] && [ -n "$RUNTIME_CPA_HOST_PORT" ]; then
+    printf '%s\n' "$RUNTIME_CPA_HOST_PORT"
+  else
+    resolve_cpa_host_port "$install_dir"
   fi
-
-  secrets_value="$(load_secrets_value "$install_dir/.secrets.txt" "CPA_API" || true)"
-  if [[ "$secrets_value" =~ :([0-9]+)/v1$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
-    return 0
-  fi
-
-  printf '%s\n' "${CPA_HOST_PORT:-$DEFAULT_CPA_HOST_PORT}"
 }
 
 detect_cpam_port() {
-  local install_dir="${1:-$(detect_install_dir)}"
-  local port
-  local secrets_value
-
-  local manager_container
-  manager_container="$(active_cpam_container)"
-
-  if port="$(port_from_docker_mapping "$manager_container" "$CPAM_INTERNAL_PORT")"; then
-    printf '%s\n' "$port"
-    return 0
+  local install_dir="${1:-${RUNTIME_INSTALL_DIR:-$(detect_install_dir)}}"
+  if [ "$RUNTIME_INSTALL_DIR" = "$install_dir" ] && [ -n "$RUNTIME_MANAGER_HOST_PORT" ]; then
+    printf '%s\n' "$RUNTIME_MANAGER_HOST_PORT"
+  else
+    resolve_manager_host_port "$install_dir" "$RUNTIME_MANAGER_CONTAINER"
   fi
-
-  secrets_value="$(load_secrets_value "$install_dir/.secrets.txt" "CPA_MANAGER" || true)"
-  if [[ "$secrets_value" =~ :([0-9]+)/management\.html$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
-    return 0
-  fi
-
-  printf '%s\n' "${CPAM_HOST_PORT:-$DEFAULT_CPAM_HOST_PORT}"
 }
 
 ensure_compose_dir() {
@@ -1055,8 +1071,8 @@ write_snapshot_metadata() {
   checksum_sha256="$(sha256sum "$archive_file" | awk '{print $1}')"
   remark="$(sanitize_snapshot_remark "$remark")"
   collect_runtime_status "$install_dir"
-  cpa_host_port="$(detect_cpa_port "$install_dir")"
-  manager_host_port="$(detect_cpam_port "$install_dir")"
+  cpa_host_port="$RUNTIME_CPA_HOST_PORT"
+  manager_host_port="$RUNTIME_MANAGER_HOST_PORT"
   cat > "$snapshot_dir/metadata.env" <<EOF
 format_version=2
 snapshot_id=$snapshot_id
@@ -1522,8 +1538,9 @@ validate_snapshot_restore() {
   local api_key
   local attempt
 
-  cpa_host_port="$(detect_cpa_port "$install_dir")"
-  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  collect_runtime_status "$install_dir"
+  cpa_host_port="$RUNTIME_CPA_HOST_PORT"
+  cpam_host_port="$RUNTIME_MANAGER_HOST_PORT"
   api_key="$(load_secrets_value "$install_dir/.secrets.txt" "API_KEY" || true)"
   for attempt in 1 2 3 4 5 6; do
     if curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null 2>&1 &&
@@ -1635,11 +1652,15 @@ health_check() {
   local cpamp_admin_key
   local manager_container
 
+  if [ -z "$cpa_host_port" ] || [ -z "$cpam_host_port" ]; then
+    collect_runtime_status "$install_dir"
+  fi
+
   if [ -z "$cpa_host_port" ]; then
-    cpa_host_port="$(detect_cpa_port "$install_dir")"
+    cpa_host_port="$RUNTIME_CPA_HOST_PORT"
   fi
   if [ -z "$cpam_host_port" ]; then
-    cpam_host_port="$(detect_cpam_port "$install_dir")"
+    cpam_host_port="$RUNTIME_MANAGER_HOST_PORT"
   fi
   if [ -z "$api_key" ]; then
     api_key="$(load_secrets_value "$install_dir/.secrets.txt" "API_KEY" || true)"
@@ -1656,7 +1677,7 @@ health_check() {
     printf '%b  跳过，未找到 API_KEY\n' "$ICON_WARN"
   fi
 
-  manager_container="$(active_cpam_container)"
+  manager_container="$RUNTIME_MANAGER_CONTAINER"
   if [ "$manager_container" = "$CPAM_CONTAINER" ]; then
     printf 'Plus 健康：'
     if curl -fsS --max-time 8 "http://127.0.0.1:${cpam_host_port}/health" >/dev/null 2>&1; then
@@ -2032,8 +2053,8 @@ status_cpa_cpam() {
 
   collect_runtime_status
   install_dir="$RUNTIME_INSTALL_DIR"
-  cpa_host_port="$(detect_cpa_port "$install_dir")"
-  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  cpa_host_port="$RUNTIME_CPA_HOST_PORT"
+  cpam_host_port="$RUNTIME_MANAGER_HOST_PORT"
 
   print_section "部署信息"
   printf '安装目录：%s\n' "$install_dir"
@@ -2115,8 +2136,8 @@ configuration_doctor() {
     doctor_result error "缺少 config.yaml"
   fi
 
-  cpa_port="$(detect_cpa_port "$install_dir")"
-  manager_port="$(detect_cpam_port "$install_dir")"
+  cpa_port="$RUNTIME_CPA_HOST_PORT"
+  manager_port="$RUNTIME_MANAGER_HOST_PORT"
   if validate_port "$cpa_port" && validate_port "$manager_port"; then
     if [ "$cpa_port" = "$manager_port" ]; then
       doctor_result error "CPA 与 Manager 使用相同宿主机端口: $cpa_port"
@@ -2471,8 +2492,9 @@ reset_management_keys() {
   [ "$install_type" = "plus" ] || die "密钥重置仅支持已部署的 CPA Manager Plus"
   install_dir="$(detect_install_dir)"
   ensure_compose_dir "$install_dir"
-  cpa_host_port="$(detect_cpa_port "$install_dir")"
-  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  collect_runtime_status "$install_dir"
+  cpa_host_port="$RUNTIME_CPA_HOST_PORT"
+  cpam_host_port="$RUNTIME_MANAGER_HOST_PORT"
   old_plus_key="$(load_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" || true)"
 
   print_section "重新生成管理密钥"
@@ -2826,6 +2848,7 @@ collect_ranked_public_ips() {
   } | awk -F '\t' '$3 == "public" { print $2 }' | sort -u | head -n 100 > "$public_ips"
 }
 
+# 统一生成 IP-API Batch 请求体，调用方只负责提供已去重的公网 IP 清单。
 build_ip_api_batch_request() {
   local public_ips="$1"
   local request_file="$2"
@@ -2838,28 +2861,30 @@ build_ip_api_batch_request() {
       })' "$public_ips" > "$request_file"
 }
 
-# 仅把当前审计两张榜单前 30 名中的公网 IP 发给 IP-API；内网和回环地址只在本地标记。
-query_ranked_ip_geolocation() {
-  local success_report="$1"
-  local failure_report="$2"
-  local geo_report="$3"
-  local work_dir="$4"
-  local public_ips="$work_dir/public-ips.txt"
+# 调用公共 IP-API Batch 接口并把结果写成统一的 IP/归属 TSV。
+# 该函数不关心 IP 来自消费审计、管理审计还是其他只读报告，避免重复实现网络请求和解析逻辑。
+query_public_ip_geolocation_batch() {
+  local public_ips="$1"
+  local geo_report="$2"
+  local work_dir="$3"
   local request_file="$work_dir/ip-api-request.json"
   local response_file="$work_dir/ip-api-response.json"
   local request_url
+  local transport_label
 
   : > "$geo_report"
-  collect_ranked_public_ips "$success_report" "$failure_report" "$public_ips"
-
   if [ ! -s "$public_ips" ]; then
-    log "排行榜中没有需要查询归属的公网 IP"
+    log "没有需要查询归属的公网 IP"
     return 0
   fi
 
-  print_section "公网 IP 归属查询（IP-API Batch）"
   printf '待查询公网 IP：%s 个；内网和本地地址不会发送。\n' "$(wc -l < "$public_ips" | tr -d ' ')"
-  printf '隐私提示：免费 Batch 接口使用 HTTP，请求中的公网 IP 会发送给 ip-api.com。\n'
+  case "$IP_API_BATCH_URL" in
+    https://*) transport_label="HTTPS" ;;
+    http://*) transport_label="HTTP" ;;
+    *) transport_label="当前配置协议" ;;
+  esac
+  printf '隐私提示：Batch 接口使用 %s，请求中的公网 IP 会发送给配置的归属查询服务。\n' "$transport_label"
   if ! ask_yes_no "确认调用 $IP_API_BATCH_URL 批量查询排行榜公网 IP" "N"; then
     log "已跳过公网 IP 归属查询，排行榜仍会正常显示"
     return 0
@@ -2906,6 +2931,21 @@ query_ranked_ip_geolocation() {
     | @tsv' "$response_file" > "$geo_report"
 
   log "IP-API Batch 归属查询完成"
+}
+
+# 仅把当前审计两张榜单前 30 名中的公网 IP 发给 IP-API；内网和回环地址只在本地标记。
+# 消费和管理审计分别传入自己的报告文件，公共查询层不会混合两类数据。
+query_ranked_ip_geolocation() {
+  local success_report="$1"
+  local failure_report="$2"
+  local geo_report="$3"
+  local work_dir="$4"
+  local public_ips="$work_dir/public-ips.txt"
+
+  : > "$geo_report"
+  collect_ranked_public_ips "$success_report" "$failure_report" "$public_ips"
+  print_section "公网 IP 归属查询（IP-API Batch）"
+  query_public_ip_geolocation_batch "$public_ips" "$geo_report" "$work_dir"
 }
 
 # 管理行为除 IP 排名外，再显示方法和脱敏路径，帮助判断发生了查看、修改还是删除操作。
@@ -3176,8 +3216,8 @@ migrate_cpa_cpam() {
   install_dir="$RUNTIME_INSTALL_DIR"
   ensure_compose_dir "$install_dir"
   standard_manager_data_source "$install_dir" >/dev/null || die "当前 /data 不是标准 $install_dir/cpa-manager-data bind mount；为避免数据损坏，自动迁移已阻断"
-  cpa_host_port="$(detect_cpa_port "$install_dir")"
-  cpam_host_port="$(detect_cpam_port "$install_dir")"
+  cpa_host_port="$RUNTIME_CPA_HOST_PORT"
+  cpam_host_port="$RUNTIME_MANAGER_HOST_PORT"
   current_cpa_image="$RUNTIME_CPA_IMAGE"
   [ -n "$current_cpa_image" ] && CPA_IMAGE="$current_cpa_image"
   cpamp_admin_key="${CPAMP_ADMIN_KEY:-$(generate_cpamp_admin_key)}"
