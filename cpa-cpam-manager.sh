@@ -1034,6 +1034,32 @@ snapshot_metadata_value() {
   awk -F= -v key="$key" 'index($0, key "=") == 1 { sub(/^[^=]*=/, ""); print; exit }' "$metadata_file" 2>/dev/null
 }
 
+# 校验人工快照、系统保护点和迁移快照共用的元数据及主归档。
+# 旧版本 metadata.env 仍允许读取，只要包含原有 archive/checksum_sha256 字段。
+validate_snapshot_metadata() {
+  local metadata_file="$1"
+  local snapshot_dir
+  local archive_name
+  local checksum_sha256
+  local actual_checksum
+  local format_version
+
+  [ -s "$metadata_file" ] || return 1
+  snapshot_dir="$(dirname "$metadata_file")"
+  format_version="$(snapshot_metadata_value "$metadata_file" format_version)"
+  case "$format_version" in
+    2|3) ;;
+    *) return 1 ;;
+  esac
+  archive_name="$(snapshot_metadata_value "$metadata_file" archive)"
+  checksum_sha256="$(snapshot_metadata_value "$metadata_file" checksum_sha256)"
+  [ -n "$archive_name" ] && [[ "$archive_name" != */* ]] || return 1
+  [ -s "$snapshot_dir/$archive_name" ] || return 1
+  [[ "$checksum_sha256" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  actual_checksum="$(sha256sum "$snapshot_dir/$archive_name" | awk '{print $1}')"
+  [ "$actual_checksum" = "$checksum_sha256" ]
+}
+
 human_file_size() {
   local bytes="$1"
   if command -v numfmt >/dev/null 2>&1; then
@@ -1065,6 +1091,7 @@ write_snapshot_metadata() {
   local checksum_sha256
   local cpa_host_port
   local manager_host_port
+  local protection_point
 
   [ -s "$archive_file" ] || return 1
   size_bytes="$(wc -c < "$archive_file" | tr -d ' ')"
@@ -1073,16 +1100,28 @@ write_snapshot_metadata() {
   collect_runtime_status "$install_dir"
   cpa_host_port="$RUNTIME_CPA_HOST_PORT"
   manager_host_port="$RUNTIME_MANAGER_HOST_PORT"
+  protection_point="false"
+  if [ "$category" = "system" ] || [ "$category" = "migration" ]; then
+    protection_point="true"
+  fi
   cat > "$snapshot_dir/metadata.env" <<EOF
-format_version=2
+format_version=3
 snapshot_id=$snapshot_id
 category=$category
+snapshot_type=$category
 mode=$mode
 reason=$snapshot_id
+trigger=$snapshot_id
+protection_point=$protection_point
 created_at=$(date -Iseconds)
 size_bytes=$size_bytes
 checksum_sha256=$checksum_sha256
+primary_archive=$archive_name
+primary_size_bytes=$size_bytes
+primary_checksum_sha256=$checksum_sha256
+artifacts=primary:$archive_name
 remark=$remark
+description=$remark
 script_version=$SCRIPT_VERSION
 install_dir=$install_dir
 cpa_host_port=$cpa_host_port
@@ -1113,6 +1152,10 @@ append_secondary_snapshot_archive() {
 ${prefix}_archive=$(basename "$archive_file")
 ${prefix}_size_bytes=$size_bytes
 ${prefix}_checksum_sha256=$checksum_sha256
+artifact_${prefix}_archive=$(basename "$archive_file")
+artifact_${prefix}_size_bytes=$size_bytes
+artifact_${prefix}_checksum_sha256=$checksum_sha256
+artifacts_append=${prefix}:$(basename "$archive_file")
 EOF
 }
 
@@ -1213,7 +1256,7 @@ collect_and_print_snapshots() {
     archive_name="$(snapshot_metadata_value "$metadata_file" archive)"
     [ -n "$archive_name" ] || archive_name="snapshot.tar.gz"
     [ -n "$size_bytes" ] || size_bytes="$(wc -c < "$snapshot_dir/$archive_name" 2>/dev/null | tr -d ' ' || printf '0')"
-    if [ -s "$snapshot_dir/$archive_name" ]; then
+    if validate_snapshot_metadata "$metadata_file"; then
       status_icon="$ICON_OK"
     else
       status_icon="$ICON_ERROR"
@@ -1579,6 +1622,7 @@ restore_snapshot() {
 
   snapshot_dir="${SNAPSHOT_DIRS[$((selection - 1))]}"
   metadata_file="$snapshot_dir/metadata.env"
+  validate_snapshot_metadata "$metadata_file" || die "快照元数据或主归档校验失败: $metadata_file"
   archive_file="$snapshot_dir/$(snapshot_metadata_value "$metadata_file" archive)"
   snapshot_id="$(snapshot_metadata_value "$metadata_file" snapshot_id)"
   created_at="$(snapshot_metadata_value "$metadata_file" created_at)"
@@ -3153,7 +3197,7 @@ EOF
 rollback_from_snapshot() {
   local install_dir="$1"
   local snapshot_dir="$2"
-  local backup_file="$snapshot_dir/pre-migration.tar.gz"
+  local backup_file
   local metadata_file="$snapshot_dir/metadata.env"
   local expected_checksum
   local failed_dir
@@ -3161,9 +3205,12 @@ rollback_from_snapshot() {
 
   [ -d "$snapshot_dir" ] || die "迁移快照不存在: $snapshot_dir"
   if [ -f "$metadata_file" ]; then
+    validate_snapshot_metadata "$metadata_file" || die "迁移快照元数据或主归档校验失败: $metadata_file"
+    backup_file="$snapshot_dir/$(snapshot_metadata_value "$metadata_file" archive)"
     expected_checksum="$(snapshot_metadata_value "$metadata_file" checksum_sha256)"
     verify_restorable_snapshot "$backup_file" "$expected_checksum" || die "迁移快照校验失败或包含不安全路径: $backup_file"
   else
+    backup_file="$snapshot_dir/pre-migration.tar.gz"
     verify_snapshot_archive "$backup_file" || die "旧格式迁移快照损坏或不可读: $backup_file"
   fi
 

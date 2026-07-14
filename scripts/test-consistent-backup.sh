@@ -98,7 +98,11 @@ PY
   create_snapshot_record "$TEMP_DIR/install" manual manual "自动测试备注" online
   [ -f "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" ]
   [ -f "$CREATED_SNAPSHOT_DIR/metadata.env" ]
-  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" format_version)" = "2" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" format_version)" = "3" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" snapshot_type)" = "manual" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" protection_point)" = "false" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" primary_archive)" = "snapshot.tar.gz" ]
+  validate_snapshot_metadata "$CREATED_SNAPSHOT_DIR/metadata.env"
   [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" script_version)" = "$SCRIPT_VERSION" ]
   [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" restore_scope)" = "managed-deployment" ]
   [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" remark)" = "自动测试备注" ]
@@ -108,6 +112,10 @@ PY
     printf '升级前系统保护点不应允许通过普通入口删除。\n' >&2
     exit 1
   fi
+  create_snapshot_record "$TEMP_DIR/install" system scheduled "系统保护点测试" online
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" snapshot_type)" = "system" ]
+  [ "$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" protection_point)" = "true" ]
+  validate_snapshot_metadata "$CREATED_SNAPSHOT_DIR/metadata.env"
   SNAPSHOT_CHECKSUM="$(snapshot_metadata_value "$CREATED_SNAPSHOT_DIR/metadata.env" checksum_sha256)"
   verify_restorable_snapshot "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" "$SNAPSHOT_CHECKSUM"
   cp "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" "$TEMP_DIR/corrupted-snapshot.tar.gz"
@@ -117,7 +125,7 @@ PY
     exit 1
   fi
   collect_and_print_snapshots "$TEMP_DIR/install" >/dev/null
-  [ "${#SNAPSHOT_DIRS[@]}" -eq 1 ]
+  [ "${#SNAPSHOT_DIRS[@]}" -eq 2 ]
 
   mkdir -p "$TEMP_DIR/install/snapshots/system"
   cp -a "$CREATED_SNAPSHOT_DIR" "$TEMP_DIR/install/snapshots/system/scheduled-2026-07-10-030000"
