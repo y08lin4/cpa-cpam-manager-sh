@@ -97,6 +97,12 @@ fi
 [ ! -e "$ROOT_DIR/backups" ]
 [ "$(grep -c '^backups/$' "$ROOT_DIR/.gitignore" || true)" -eq 0 ]
 
+# 当前脚本只允许明确确认后的端口放行，不得根据审计 IP 自动写入封禁规则。
+if grep -Eiq 'iptables|nftables?|ufw[[:space:]]+(deny|delete[[:space:]]+deny)|ban[_-]?ip|block[_-]?ip' "$ROOT_DIR/cpa-cpam-manager.sh"; then
+  printf '脚本不应包含自动封禁 IP 的实现或命令。\n' >&2
+  exit 1
+fi
+
 # 验证全局确认默认值生效，且非交互环境不会因为默认 Y 自动执行。
 if [ "$CONFIRM_DEFAULT" != "Y" ]; then
   printf '全局确认默认值应为 Y。\n' >&2
