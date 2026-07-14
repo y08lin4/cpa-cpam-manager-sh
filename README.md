@@ -228,7 +228,7 @@ bash cpa-cpam-manager.sh migration-assess
 - 是否允许进入自动迁移流程。
 - 完整迁移步骤、停机范围、验证项目和回滚方式。
 
-该命令不会停止容器，也不会修改 Compose、密钥或数据。旧 `preflight` 和 `migrate --dry-run` 暂时转发到同一评估逻辑，但不再作为独立菜单功能。
+该命令不会停止容器，也不会修改 Compose、密钥或数据。旧 `preflight` 命令已删除；`migrate --dry-run` 作为正式迁移命令的只读参数暂时转发到同一评估逻辑，不会形成独立菜单入口。
 
 ### 2. 正式迁移
 

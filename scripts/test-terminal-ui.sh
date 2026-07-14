@@ -82,6 +82,10 @@ if grep -Fq '安全巡检 / 24h IP' <<<"$MENU_OUTPUT"; then
   exit 1
 fi
 HELP_OUTPUT="$(print_help)"
+if grep -Eq '(^|[[:space:]])preflight([[:space:]]|$)' <<<"$HELP_OUTPUT"; then
+  printf '帮助文本不应继续暴露已删除的 preflight 独立入口。\n' >&2
+  exit 1
+fi
 if grep -Eq '(^|[[:space:]])security([[:space:]]|$)|安全巡检|24h IP' <<<"$HELP_OUTPUT"; then
   printf '帮助文本不应继续暴露旧混合行为入口。\n' >&2
   exit 1

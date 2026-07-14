@@ -3486,7 +3486,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|doctor|logs|snapshot|snapshots|restore-snapshot|snapshot-delete|snapshot-schedule|scheduled-snapshot|keys|reset-keys|uninstall|codex-login|audit-consumption|audit-management|migration-assess|preflight)
+    menu|install|upgrade|start|stop|restart|status|doctor|logs|snapshot|snapshots|restore-snapshot|snapshot-delete|snapshot-schedule|scheduled-snapshot|keys|reset-keys|uninstall|codex-login|audit-consumption|audit-management|migration-assess)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -3519,10 +3519,6 @@ main() {
     audit-consumption) consumption_audit ;;
     audit-management) management_audit ;;
     migration-assess) migration_assess ;;
-    preflight)
-      warn "preflight 已合并为 migration-assess；正在执行统一迁移评估"
-      migration_assess
-      ;;
   esac
 }
 
