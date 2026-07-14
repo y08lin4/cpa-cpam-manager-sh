@@ -37,6 +37,7 @@ cat > "$TEMP_DIR/install/logs/access.log" <<'EOF'
 2026/07/12 08:09:00 http PUT /usage-service/config status=200 duration=2ms remote=172.18.0.1:45678
 2026/07/12 08:10:00 http GET /health status=200 duration=1ms remote=[::1]:45679
 request from 208.67.222.222 status=500
+unauthorized from 198.51.100.8 status=401
 EOF
 
 container_exists() {
@@ -57,6 +58,7 @@ grep -Fq $'event\tsuccess\t1\tPUT\t/usage-service/config' <<<"$REPORT"
 grep -Fq $'diagnostic\tfiltered\t3' <<<"$REPORT"
 grep -Fq $'diagnostic\tunclassified\t1' <<<"$REPORT"
 grep -Fq $'diagnostic\tno_result\t1' <<<"$REPORT"
+grep -Fq $'diagnostic\tno_path\t2' <<<"$REPORT"
 if grep -Eq '208\.67\.222\.222|127\.0\.0\.1|192\.168\.1\.20' <<<"$REPORT"; then
   printf '无路径日志、健康检查和模型列表不应进入任何行为榜单。\n' >&2
   exit 1

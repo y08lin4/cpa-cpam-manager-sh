@@ -2707,6 +2707,9 @@ plus_access = re.compile(
     r'status=(?P<status>[1-5][0-9]{2})\b.*?\bremote=(?P<remote>\S+)',
     re.I,
 )
+# 只用于诊断“不带明确 HTTP 方法和路径”的日志；绝不据此推断行为类型。
+ambiguous_status = re.compile(r'\b(?:status|status_code|code)\s*[=:]?\s*[1-5][0-9]{2}\b', re.I)
+ambiguous_ip = re.compile(r'(?<![\w:])(?:\d{1,3}\.){3}\d{1,3}(?![\w:])|(?<![\w:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:]+(?![\w:])', re.I)
 
 consumption_exact = {
     "/v1/chat/completions",
@@ -2803,6 +2806,8 @@ for line in lines:
     seen_lines.add(line)
     match = cli_access.search(line) or plus_access.search(line)
     if not match:
+        if ambiguous_status.search(line) and ambiguous_ip.search(line):
+            diagnostics["no_path"] += 1
         continue
     address = parse_remote(match.group("remote"))
     if address is None or address.is_multicast or address.is_unspecified:
@@ -2841,7 +2846,7 @@ for behavior in ("consumption", "management"):
 
 for (outcome, method, request_path), count in management_events.most_common(30):
     print(f"event\t{outcome}\t{count}\t{method}\t{request_path}")
-for name in ("filtered", "unclassified", "invalid_ip", "no_result"):
+for name in ("filtered", "unclassified", "invalid_ip", "no_result", "no_path"):
     print(f"diagnostic\t{name}\t{diagnostics[name]}")
 PY
 }
@@ -3027,6 +3032,7 @@ behavior_audit() {
   local sample_lines
   local filtered_requests
   local unclassified_requests
+  local no_path_requests
   local title_prefix
 
   case "$behavior" in
@@ -3068,12 +3074,15 @@ behavior_audit() {
   sample_lines="$(wc -l < "$log_sample" | tr -d ' ')"
   filtered_requests="$(awk -F '\t' '$1 == "diagnostic" && $2 == "filtered" { print $3 + 0 }' "$ip_report")"
   unclassified_requests="$(awk -F '\t' '$1 == "diagnostic" && $2 == "unclassified" { print $3 + 0 }' "$ip_report")"
+  no_path_requests="$(awk -F '\t' '$1 == "diagnostic" && $2 == "no_path" { print $3 + 0 }' "$ip_report")"
   filtered_requests="${filtered_requests:-0}"
   unclassified_requests="${unclassified_requests:-0}"
+  no_path_requests="${no_path_requests:-0}"
 
   printf '\n日志采样：%s 行\n' "$sample_lines"
   printf '已过滤健康检查、模型列表和静态资源：%s 条\n' "$filtered_requests"
   printf '未分类请求：%s 条（不进入任何榜单）\n' "$unclassified_requests"
+  printf '无路径模糊日志：%s 条（仅诊断，不进入任何榜单）\n' "$no_path_requests"
   printf '\n已识别%s来源 IP：%s 个\n' "$behavior_label" "$total_sources"
   printf '成功：%s 次    失败：%s 次\n' "$success_calls" "$failure_calls"
   if [ "$auth_failures" -gt 0 ]; then
