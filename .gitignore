@@ -1,6 +1,5 @@
 .secrets.txt
 *.bak.*
-backups/
 auths/
 logs/
 cpa-manager-data/

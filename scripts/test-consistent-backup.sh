@@ -91,9 +91,9 @@ PY
   ONLINE_BACKUP_FILE="$TEMP_DIR/online-backup.tar.gz"
   create_online_snapshot_archive "$TEMP_DIR/install" "$ONLINE_BACKUP_FILE"
   verify_snapshot_archive "$ONLINE_BACKUP_FILE"
-  tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './BACKUP-MANIFEST.txt'
+  tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './SNAPSHOT-MANIFEST.txt'
   tar -tzf "$ONLINE_BACKUP_FILE" | grep -Fq './cpa-manager-data/usage.sqlite'
-  tar -xOf "$ONLINE_BACKUP_FILE" ./BACKUP-MANIFEST.txt | grep -Fq '快速不停机快照'
+  tar -xOf "$ONLINE_BACKUP_FILE" ./SNAPSHOT-MANIFEST.txt | grep -Fq '快速不停机快照'
 
   create_snapshot_record "$TEMP_DIR/install" manual manual "自动测试备注" online
   [ -f "$CREATED_SNAPSHOT_DIR/snapshot.tar.gz" ]

@@ -944,7 +944,7 @@ PY
     warn "未找到 Manager SQLite，快速快照将只包含配置和凭证"
   fi
 
-  cat > "$staging_dir/BACKUP-MANIFEST.txt" <<EOF
+  cat > "$staging_dir/SNAPSHOT-MANIFEST.txt" <<EOF
 快照模式：快速不停机快照
 创建时间：$(date -Iseconds)
 强一致内容：Manager SQLite 在线快照
@@ -1567,7 +1567,7 @@ verify_restorable_snapshot() {
       *'/../'*) return 1 ;;
     esac
     case "$entry" in
-      docker-compose.yml|config.yaml|.secrets.txt|BACKUP-MANIFEST.txt|auths|auths/*|cpa-manager-data|cpa-manager-data/*) ;;
+      docker-compose.yml|config.yaml|.secrets.txt|SNAPSHOT-MANIFEST.txt|auths|auths/*|cpa-manager-data|cpa-manager-data/*) ;;
       *) warn "快照包含未知路径，已拒绝恢复: $entry"; return 1 ;;
     esac
   done < <(tar -tzf "$archive_file")
@@ -3235,7 +3235,11 @@ rollback_cpa_cpam() {
   local snapshot_dir
 
   install_dir="$(detect_install_dir)"
-  marker_file="$install_dir/.last-migration-backup"
+  marker_file="$install_dir/.last-migration-snapshot"
+  if [ ! -f "$marker_file" ] && [ -f "$install_dir/.last-migration-backup" ]; then
+    warn "发现旧版迁移标记文件，将只读兼容读取；后续迁移会使用 .last-migration-snapshot"
+    marker_file="$install_dir/.last-migration-backup"
+  fi
   [ -f "$marker_file" ] || die "未找到可用迁移快照标记: $marker_file"
   snapshot_dir="$(head -n 1 "$marker_file")"
 
@@ -3301,7 +3305,7 @@ migrate_cpa_cpam() {
   }
 
   docker inspect "$LEGACY_CPAM_CONTAINER" > "$snapshot_dir/legacy-container-inspect.json" 2>/dev/null || true
-  printf '%s\n' "$snapshot_dir" > "$install_dir/.last-migration-backup"
+  printf '%s\n' "$snapshot_dir" > "$install_dir/.last-migration-snapshot"
   mv -f "$temp_compose" "$install_dir/docker-compose.yml"
   upsert_secrets_value "$install_dir/.secrets.txt" "CPAMP_ADMIN_KEY" "$cpamp_admin_key"
 

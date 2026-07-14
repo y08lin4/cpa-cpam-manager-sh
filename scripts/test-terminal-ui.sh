@@ -86,6 +86,12 @@ if grep -Eq '(^|[[:space:]])security([[:space:]]|$)|安全巡检|24h IP' <<<"$HE
   printf '帮助文本不应继续暴露旧混合行为入口。\n' >&2
   exit 1
 fi
+if grep -Eq '(^|[[:space:]])backup([[:space:]]|$)|backups/' <<<"$HELP_OUTPUT"; then
+  printf '帮助文本不应继续暴露旧备份命令或目录叫法。\n' >&2
+  exit 1
+fi
+[ ! -e "$ROOT_DIR/backups" ]
+[ "$(grep -c '^backups/$' "$ROOT_DIR/.gitignore" || true)" -eq 0 ]
 
 # 验证全局确认默认值生效，且非交互环境不会因为默认 Y 自动执行。
 if [ "$CONFIRM_DEFAULT" != "Y" ]; then
