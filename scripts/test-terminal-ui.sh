@@ -69,10 +69,13 @@ RUNTIME_MANAGER_HOST_PORT="28317"
 MENU_OUTPUT="$(print_main_menu)"
 grep -Fq '7) 配置体检（只读）' <<<"$MENU_OUTPUT"
 grep -Fq '15) 删除指定快照' <<<"$MENU_OUTPUT"
-grep -Fq '16) 定时快照设置' <<<"$MENU_OUTPUT"
+grep -Fq '16) 计划任务中心（版本检查 / 自动快照）' <<<"$MENU_OUTPUT"
 grep -Fq '17) 迁移评估（只读）' <<<"$MENU_OUTPUT"
 grep -Fq '20) 消费行为审计' <<<"$MENU_OUTPUT"
 grep -Fq '21) 管理行为审计' <<<"$MENU_OUTPUT"
+HELP_OUTPUT="$(print_help)"
+grep -Fq 'task-center' <<<"$HELP_OUTPUT"
+grep -Fq '定时版本检查和自动快照' <<<"$HELP_OUTPUT"
 if grep -Fq '查看迁移计划' <<<"$MENU_OUTPUT"; then
   printf '迁移计划已合并进迁移评估，不应保留独立入口。\n' >&2
   exit 1

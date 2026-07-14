@@ -574,6 +574,61 @@ print_upgrade_service() {
   fi
 }
 
+# 只读检查两个服务的当前镜像与仓库镜像，不重建容器、不修改部署。
+check_available_versions() {
+  local install_dir
+  local install_type
+  local cpa_ref
+  local manager_ref
+  local cpa_current_id
+  local manager_current_id
+  local cpa_target_id
+  local manager_target_id
+  local cpa_changed="false"
+  local manager_changed="false"
+
+  collect_runtime_status
+  install_dir="$RUNTIME_INSTALL_DIR"
+  install_type="$RUNTIME_INSTALL_TYPE"
+  case "$install_type" in
+    legacy) warn "当前为旧 CPA-Manager，请先迁移后再检查 Plus 版本"; return 1 ;;
+    mixed) warn "同时存在新旧 Manager，已跳过版本检查"; return 1 ;;
+  esac
+  [ "$RUNTIME_CPA_EXISTS" = "true" ] && [ "$RUNTIME_PLUS_EXISTS" = "true" ] || {
+    warn "未检测到完整的 CPA + CPA Manager Plus 部署，无法检查版本"
+    return 1
+  }
+  cpa_ref="$RUNTIME_CPA_IMAGE"
+  manager_ref="$RUNTIME_PLUS_IMAGE"
+  cpa_current_id="$RUNTIME_CPA_IMAGE_ID"
+  manager_current_id="$RUNTIME_PLUS_IMAGE_ID"
+  [ -n "$cpa_ref" ] && [ -n "$manager_ref" ] && [ -n "$cpa_current_id" ] && [ -n "$manager_current_id" ] || {
+    warn "无法读取当前容器镜像信息"
+    return 1
+  }
+
+  print_section "版本检查（只读）"
+  printf '安装目录：%s\n' "$install_dir"
+  pull_image_quietly "$cpa_ref" || return 1
+  pull_image_quietly "$manager_ref" || return 1
+  cpa_target_id="$(image_ref_id "$cpa_ref")"
+  manager_target_id="$(image_ref_id "$manager_ref")"
+  [ -n "$cpa_target_id" ] && [ -n "$manager_target_id" ] || return 1
+  [ "$cpa_current_id" != "$cpa_target_id" ] && cpa_changed="true"
+  [ "$manager_current_id" != "$manager_target_id" ] && manager_changed="true"
+  print_upgrade_service "CLIProxyAPI" \
+    "$(image_display_version "$cpa_current_id" "$cpa_ref")" \
+    "$(image_display_version "$cpa_target_id" "$cpa_ref")" "$cpa_changed"
+  printf '\n'
+  print_upgrade_service "CPA Manager Plus" \
+    "$(image_display_version "$manager_current_id" "$manager_ref")" \
+    "$(image_display_version "$manager_target_id" "$manager_ref")" "$manager_changed"
+  if [ "$cpa_changed" = "true" ] || [ "$manager_changed" = "true" ]; then
+    return 10
+  fi
+  return 0
+}
+
 # -----------------------------------------------------------------------------
 # 端口、Compose 与安装文件
 # -----------------------------------------------------------------------------
@@ -1411,7 +1466,8 @@ run_scheduled_snapshot() {
   ensure_compose_dir "$install_dir"
   mkdir -p "$install_dir/state"
   chmod 700 "$install_dir/state"
-  schedule_file="$install_dir/state/snapshot-schedule.env"
+  schedule_file="$install_dir/state/task-center.env"
+  [ -f "$schedule_file" ] || schedule_file="$install_dir/state/snapshot-schedule.env"
   if [ -f "$schedule_file" ]; then
     keep_count="$(awk -F= '$1 == "KEEP_COUNT" { print $2; exit }' "$schedule_file")"
   fi
@@ -1426,7 +1482,153 @@ run_scheduled_snapshot() {
   prune_scheduled_snapshots "$install_dir" "$keep_count"
 }
 
-configure_snapshot_schedule() {
+run_scheduled_version_check() {
+  local install_dir="${INSTALL_DIR:-$(detect_install_dir)}"
+  local report_file="$install_dir/state/version-check.latest.txt"
+  local result=0
+
+  mkdir -p "$install_dir/state"
+  chmod 700 "$install_dir/state"
+  exec 9> "$install_dir/state/version-check.lock"
+  if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    warn "已有版本检查任务正在运行，本次任务跳过"
+    return 0
+  fi
+  if check_available_versions >"$report_file" 2>&1; then
+    result=0
+  else
+    result=$?
+    [ "$result" -eq 10 ] || result=1
+  fi
+  chmod 600 "$report_file"
+  cat "$report_file"
+  if [ "$result" -eq 10 ]; then
+    warn "发现可用新镜像；仅记录结果，不会自动升级"
+    return 0
+  fi
+  return "$result"
+}
+
+configure_task_center() {
+  local install_dir
+  local frequency
+  local on_calendar
+  local keep_count
+  local enable_version
+  local enable_snapshot
+  local managed_script
+  local source_script="${BASH_SOURCE[0]}"
+  local snapshot_service="/etc/systemd/system/cpa-cpam-snapshot.service"
+  local snapshot_timer="/etc/systemd/system/cpa-cpam-snapshot.timer"
+  local version_service="/etc/systemd/system/cpa-cpam-version.service"
+  local version_timer="/etc/systemd/system/cpa-cpam-version.timer"
+
+  has_systemd || die "当前系统没有可用 systemd，无法配置计划任务中心"
+  install_dir="$(detect_install_dir)"
+  ensure_compose_dir "$install_dir"
+  [[ "$install_dir" != *$'\n'* && "$install_dir" != *$'\r'* && ! "$install_dir" =~ [\"%] ]] || die "安装目录包含不适合 systemd 单元的字符"
+  print_section "计划任务中心"
+  printf '1) 每天 03:00\n'
+  printf '2) 每周日 03:00\n'
+  frequency="$(read_with_default "请选择执行频率 [1]: " "1")"
+  case "$frequency" in
+    1) on_calendar="*-*-* 03:00:00" ;;
+    2) on_calendar="Sun *-*-* 03:00:00" ;;
+    *) die "无效执行频率: $frequency" ;;
+  esac
+  keep_count="$(read_with_default "定时快照保留数量 [10]: " "10")"
+  [[ "$keep_count" =~ ^[0-9]+$ ]] && (( keep_count >= 1 && keep_count <= 100 )) || die "保留数量必须是 1-100"
+  enable_version="$(read_with_default "启用定时版本检查？[Y/n]: " "Y")"
+  enable_snapshot="$(read_with_default "启用定时快照？[Y/n]: " "Y")"
+  [[ "$enable_version" =~ ^[Yy]([Ee][Ss])?$|^$ ]] && enable_version="true" || enable_version="false"
+  [[ "$enable_snapshot" =~ ^[Yy]([Ee][Ss])?$|^$ ]] && enable_snapshot="true" || enable_snapshot="false"
+  [ "$enable_version" = "true" ] || [ "$enable_snapshot" = "true" ] || die "至少启用一个计划任务"
+
+  print_section "计划任务确认"
+  printf '安装目录：%s\n' "$install_dir"
+  printf '执行计划：%s\n' "$on_calendar"
+  printf '定时版本检查：%s（只读拉取并比较镜像，不自动升级）\n' "$([ "$enable_version" = "true" ] && printf '启用' || printf '停用')"
+  printf '定时快照：%s（不停机，保留最近 %s 个 scheduled-*）\n' "$([ "$enable_snapshot" = "true" ] && printf '启用' || printf '停用')" "$keep_count"
+  if ! ask_yes_no "确认写入并启用计划任务中心" "N"; then
+    log "已取消计划任务中心设置"
+    return 0
+  fi
+
+  mkdir -p "$install_dir/bin" "$install_dir/state"
+  chmod 700 "$install_dir/bin" "$install_dir/state"
+  managed_script="$install_dir/bin/cpa-cpam-manager.sh"
+  cp "$source_script" "$managed_script" || die "无法安装计划任务脚本副本"
+  chmod 700 "$managed_script"
+  cat > "$install_dir/state/task-center.env" <<EOF
+ON_CALENDAR=$on_calendar
+KEEP_COUNT=$keep_count
+VERSION_ENABLED=$enable_version
+SNAPSHOT_ENABLED=$enable_snapshot
+EOF
+  chmod 600 "$install_dir/state/task-center.env"
+
+  systemctl disable --now cpa-cpam-snapshot.timer cpa-cpam-version.timer >/dev/null 2>&1 || true
+  rm -f "$snapshot_service" "$snapshot_timer" "$version_service" "$version_timer"
+  if [ "$enable_snapshot" = "true" ]; then
+    cat > "$snapshot_service" <<EOF
+[Unit]
+Description=CPA Manager Plus scheduled snapshot
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment="INSTALL_DIR=$install_dir"
+ExecStart=/bin/bash "$managed_script" scheduled-snapshot
+EOF
+    cat > "$snapshot_timer" <<EOF
+[Unit]
+Description=CPA Manager Plus scheduled snapshot timer
+
+[Timer]
+OnCalendar=$on_calendar
+Persistent=true
+RandomizedDelaySec=300
+Unit=cpa-cpam-snapshot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  fi
+  if [ "$enable_version" = "true" ]; then
+    cat > "$version_service" <<EOF
+[Unit]
+Description=CPA Manager Plus scheduled version check
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+Environment="INSTALL_DIR=$install_dir"
+ExecStart=/bin/bash "$managed_script" scheduled-version-check
+EOF
+    cat > "$version_timer" <<EOF
+[Unit]
+Description=CPA Manager Plus scheduled version check timer
+
+[Timer]
+OnCalendar=$on_calendar
+Persistent=true
+RandomizedDelaySec=600
+Unit=cpa-cpam-version.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  fi
+  systemctl daemon-reload
+  [ "$enable_snapshot" = "true" ] && systemctl enable --now cpa-cpam-snapshot.timer || true
+  [ "$enable_version" = "true" ] && systemctl enable --now cpa-cpam-version.timer || true
+  log "计划任务中心已更新"
+  systemctl list-timers cpa-cpam-snapshot.timer cpa-cpam-version.timer --no-pager 2>/dev/null || true
+}
+
+configure_snapshot_schedule_legacy() {
   local install_dir
   local frequency
   local on_calendar
@@ -1508,13 +1710,21 @@ EOF
 remove_snapshot_schedule() {
   local service_file="/etc/systemd/system/cpa-cpam-snapshot.service"
   local timer_file="/etc/systemd/system/cpa-cpam-snapshot.timer"
+  local version_service="/etc/systemd/system/cpa-cpam-version.service"
+  local version_timer="/etc/systemd/system/cpa-cpam-version.timer"
 
-  if has_systemd && { [ -f "$service_file" ] || [ -f "$timer_file" ]; }; then
+  if has_systemd && { [ -f "$service_file" ] || [ -f "$timer_file" ] || [ -f "$version_service" ] || [ -f "$version_timer" ]; }; then
     systemctl disable --now cpa-cpam-snapshot.timer >/dev/null 2>&1 || true
-    rm -f "$service_file" "$timer_file"
+    systemctl disable --now cpa-cpam-version.timer >/dev/null 2>&1 || true
+    rm -f "$service_file" "$timer_file" "$version_service" "$version_timer"
     systemctl daemon-reload >/dev/null 2>&1 || true
     log "已移除定时快照 systemd timer"
   fi
+}
+
+# 兼容旧命令名称；新的配置入口统一称为计划任务中心。
+configure_snapshot_schedule() {
+  configure_task_center
 }
 
 create_snapshot() {
@@ -3371,7 +3581,9 @@ print_help() {
   snapshots  查看现有快照
   restore-snapshot  恢复快照
   snapshot-delete   删除指定人工或定时快照
-  snapshot-schedule 配置自动定时快照和滚动保留
+  task-center  配置定时版本检查和自动快照
+  snapshot-schedule 旧命令兼容别名，转发到 task-center
+  scheduled-version-check  执行一次只读版本检查并保存报告
   keys       查看密钥 / 地址
   uninstall  卸载
   help       显示帮助
@@ -3408,7 +3620,7 @@ CPA Manager Plus 运维控制台
 快照与恢复
  12) 创建快照                13) 查看现有快照
  14) 恢复快照                15) 删除指定快照
- 16) 定时快照设置
+ 16) 计划任务中心（版本检查 / 自动快照）
 
 数据与迁移
  17) 迁移评估（只读）        18) 正式迁移到 Plus
@@ -3449,7 +3661,7 @@ menu_loop() {
       13) list_snapshots ;;
       14) restore_snapshot ;;
       15) delete_snapshot ;;
-      16) configure_snapshot_schedule ;;
+      16) configure_task_center ;;
       17) migration_assess ;;
       18) migrate_cpa_cpam ;;
       19) rollback_cpa_cpam ;;
@@ -3495,7 +3707,7 @@ main() {
       rollback_cpa_cpam
       return $?
       ;;
-    menu|install|upgrade|start|stop|restart|status|doctor|logs|snapshot|snapshots|restore-snapshot|snapshot-delete|snapshot-schedule|scheduled-snapshot|keys|reset-keys|uninstall|codex-login|audit-consumption|audit-management|migration-assess)
+    menu|install|upgrade|start|stop|restart|status|doctor|logs|snapshot|snapshots|restore-snapshot|snapshot-delete|task-center|snapshot-schedule|scheduled-snapshot|scheduled-version-check|keys|reset-keys|uninstall|codex-login|audit-consumption|audit-management|migration-assess)
       install_basic_deps
       ensure_docker_interactive
       ;;
@@ -3519,8 +3731,10 @@ main() {
     snapshots) list_snapshots ;;
     restore-snapshot) restore_snapshot ;;
     snapshot-delete) delete_snapshot ;;
-    snapshot-schedule) configure_snapshot_schedule ;;
+    task-center) configure_task_center ;;
+    snapshot-schedule) configure_task_center ;;
     scheduled-snapshot) run_scheduled_snapshot ;;
+    scheduled-version-check) run_scheduled_version_check ;;
     keys) show_keys ;;
     reset-keys) reset_management_keys ;;
     uninstall) uninstall_cpa_cpam ;;

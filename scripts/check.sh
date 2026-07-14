@@ -49,8 +49,12 @@ printf '[附加 4/5] 消费与管理行为审计分离模拟检查\n'
 bash "$ROOT_DIR/scripts/test-security-audit.sh" >/dev/null
 printf '消费与管理行为审计分离模拟检查通过。\n'
 
-printf '[附加 5/5] 配置体检模拟检查\n'
+printf '[附加 5/6] 配置体检模拟检查\n'
 bash "$ROOT_DIR/scripts/test-configuration-doctor.sh" >/dev/null
 printf '配置体检模拟检查通过。\n'
+
+printf '[附加 6/6] 计划任务中心模拟检查\n'
+bash "$ROOT_DIR/scripts/test-task-center.sh" >/dev/null
+printf '计划任务中心模拟检查通过。\n'
 
 printf '静态检查完成。\n'

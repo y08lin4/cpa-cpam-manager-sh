@@ -143,7 +143,8 @@ bash cpa-cpam-manager.sh snapshots
 | `snapshots` | 按时间、类型、模式和大小查看现有快照 |
 | `restore-snapshot` | 选择并恢复快照，失败时自动回退 |
 | `snapshot-delete` | 按编号删除指定人工或定时快照 |
-| `snapshot-schedule` | 配置 systemd 自动定时快照和滚动保留 |
+| `task-center` | 配置 systemd 定时版本检查和自动快照 |
+| `snapshot-schedule` | 旧命令兼容别名，转发到 `task-center` |
 | `keys` | 显示密钥和访问地址 |
 | `reset-keys` | 重新生成 Plus 管理员密钥、CPA Management Key 或两者 |
 | `codex-login` | 输出 Codex OAuth 登录命令提示 |
@@ -345,7 +346,7 @@ bash cpa-cpam-manager.sh snapshot
 bash cpa-cpam-manager.sh snapshots
 bash cpa-cpam-manager.sh restore-snapshot
 bash cpa-cpam-manager.sh snapshot-delete
-bash cpa-cpam-manager.sh snapshot-schedule
+bash cpa-cpam-manager.sh task-center
 ```
 
 创建快照时备注可直接回车跳过，并可选择两种模式：
@@ -357,9 +358,9 @@ bash cpa-cpam-manager.sh snapshot-schedule
 
 “删除指定快照”按列表编号选择，只允许删除受管的人工快照或 `scheduled-*` 定时快照。初始安装、升级前、密钥重置前和恢复前系统保护点不能通过普通入口删除。
 
-“定时快照设置”会安装并启用 systemd timer，可选择每天或每周创建快速不停机快照，并设置保留最近 1-100 个自动快照。滚动清理只处理 `scheduled-*`；人工快照、系统保护点和迁移快照不会被自动删除。
+“计划任务中心”会安装并启用两个可独立控制的 systemd timer：定时版本检查只拉取并比较两个服务的镜像摘要，发现新版本后写入 `state/version-check.latest.txt`，不会自动升级；定时快照创建快速不停机 `scheduled-*` 快照，并设置保留最近 1-100 个自动快照。滚动清理只处理 `scheduled-*`；人工快照、系统保护点和迁移快照不会被自动删除。旧命令 `snapshot-schedule` 仍可作为兼容别名使用。
 
-定时任务使用安装目录 `bin/` 中的受管脚本副本。更新本仓库脚本后应重新运行一次 `snapshot-schedule`，让定时任务同步使用新版本。卸载服务时脚本会自动停用并删除对应 systemd timer。
+定时任务使用安装目录 `bin/` 中的受管脚本副本。更新本仓库脚本后应重新运行一次 `task-center`，让定时任务同步使用新版本。卸载服务时脚本会自动停用并删除两个 systemd timer。
 
 快照列表使用固定列展示编号、类型、创建时间、模式、大小和备注。每个快照使用独立目录，归档与元数据不会混在一起：
 
@@ -443,7 +444,8 @@ bash cpa-cpam-manager.sh uninstall
 ├── bin/
 │   └── cpa-cpam-manager.sh（启用定时快照后生成）
 └── state/
-    ├── snapshot-schedule.env
+    ├── task-center.env
+    ├── version-check.latest.txt
     └── snapshot.lock
 ```
 
